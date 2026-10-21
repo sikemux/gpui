@@ -1128,6 +1128,8 @@ impl DirectXRenderer {
                     Ok(())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // An app shader comes as WGSL and MSL, which this renderer has no use for.
+                PrimitiveBatch::RawShaders { .. } => Ok(()),
             }
             .with_context(|| {
                 format!(

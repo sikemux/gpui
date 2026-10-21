@@ -5,8 +5,8 @@ use collections::FxHashMap;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, DevicePixels, GAUSSIAN_REACH,
-    KAWASE_LEVELS, Kawase, LayerEffect, PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels,
-    Scene, ShaderId, Size, point, size,
+    KAWASE_LEVELS, Kawase, LayerEffect, PaintRawShader, PaintSurface, Path, Point, PrimitiveBatch,
+    RawShaderProgram, ScaledPixels, Scene, ShaderId, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -191,6 +191,10 @@ pub struct MetalRenderer {
     /// A pipeline per custom shader, built from its MSL translation the first time a frame draws
     /// it. A shader that failed to build is kept as `None`, so it is not built again every frame.
     custom_pipeline_states: FxHashMap<ShaderId, Option<metal::RenderPipelineState>>,
+    /// Each app shader's pipeline by its program's address, made the first time it draws;
+    /// none for one whose source would not compile.
+    raw_shader_pipelines: std::collections::HashMap<usize, Option<metal::RenderPipelineState>>,
+    started: std::time::Instant,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -608,6 +612,8 @@ impl MetalRenderer {
             composite_pipeline_state,
             masked_pipeline_state,
             custom_pipeline_states: FxHashMap::default(),
+            raw_shader_pipelines: std::collections::HashMap::new(),
+            started: std::time::Instant::now(),
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -1282,6 +1288,18 @@ impl MetalRenderer {
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range.clone()],
                     range.start,
+                    instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::RawShaders {
+                    program,
+                    image,
+                    range,
+                } => self.draw_raw_shaders(
+                    program,
+                    image,
+                    range,
                     instance_bindings,
                     viewport_size,
                     command_encoder,
@@ -2204,6 +2222,102 @@ impl MetalRenderer {
     }
 }
 
+impl MetalRenderer {
+    fn draw_raw_shaders(
+        &mut self,
+        program: &'static RawShaderProgram,
+        image: Option<AtlasTextureId>,
+        range: Range<usize>,
+        instance_bindings: &InstanceBindings,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        if range.is_empty() {
+            return;
+        }
+        let texture = match image {
+            Some(texture_id) => match self.sprite_atlas.metal_texture(texture_id) {
+                Some(texture) => Some(texture),
+                None => return,
+            },
+            None => None,
+        };
+        let device = &self.device;
+        let pipeline = self
+            .raw_shader_pipelines
+            .entry(program as *const RawShaderProgram as usize)
+            .or_insert_with(|| raw_shader_pipeline_state(device, program));
+        let Some(pipeline) = pipeline else {
+            return;
+        };
+        command_encoder.set_render_pipeline_state(pipeline);
+        let globals = RawShaderGlobals {
+            viewport_size: [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
+            premultiplied_alpha: 0,
+            time: self.started.elapsed().as_secs_f32(),
+        };
+        let globals_size = mem::size_of_val(&globals) as u64;
+        let globals_ptr = &globals as *const RawShaderGlobals as *const c_void;
+        command_encoder.set_vertex_bytes(0, globals_size, globals_ptr);
+        command_encoder.set_fragment_bytes(0, globals_size, globals_ptr);
+        let instances = &instance_bindings.raw_shaders;
+        command_encoder.set_vertex_buffer(1, Some(&instances.buffer), instances.offset as u64);
+        command_encoder.set_fragment_buffer(1, Some(&instances.buffer), instances.offset as u64);
+        if let Some(texture) = &texture {
+            command_encoder.set_fragment_texture(0, Some(texture));
+        }
+        command_encoder.draw_primitives_instanced_base_instance(
+            metal::MTLPrimitiveType::TriangleStrip,
+            0,
+            4,
+            range.len() as u64,
+            range.start as u64,
+        );
+    }
+}
+
+/// The window globals an app shader reads, laid out as GPUI's wgpu shaders declare them.
+#[repr(C)]
+struct RawShaderGlobals {
+    viewport_size: [f32; 2],
+    premultiplied_alpha: u32,
+    time: f32,
+}
+
+fn raw_shader_pipeline_state(
+    device: &metal::DeviceRef,
+    program: &RawShaderProgram,
+) -> Option<metal::RenderPipelineState> {
+    let library = device
+        .new_library_with_source(program.msl, &metal::CompileOptions::new())
+        .map_err(|error| log::error!("shader {} did not compile: {error}", program.name))
+        .ok()?;
+    let (Ok(vertex), Ok(fragment)) = (
+        library.get_function("vs_main", None),
+        library.get_function("fs_main", None),
+    ) else {
+        log::error!("shader {} has no vs_main and fs_main", program.name);
+        return None;
+    };
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(program.name);
+    descriptor.set_vertex_function(Some(vertex.as_ref()));
+    descriptor.set_fragment_function(Some(fragment.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0)?;
+    color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    color_attachment.set_blending_enabled(true);
+    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    device
+        .new_render_pipeline_state(&descriptor)
+        .map_err(|error| log::error!("shader {} has no pipeline: {error}", program.name))
+        .ok()
+}
+
 /// Layer filters can be switched off from the environment to tell a rendering problem from a
 /// compositing one.
 fn filters_enabled() -> bool {
@@ -2677,6 +2791,7 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
+    raw_shaders: InstanceBinding,
 }
 
 fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
@@ -2692,6 +2807,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
             bounds: surface.bounds,
             content_mask: surface.content_mask,
         }))?,
+        raw_shaders: writer.write_iter(scene.raw_shaders.iter().map(PaintRawShader::instance))?,
     })
 }
 

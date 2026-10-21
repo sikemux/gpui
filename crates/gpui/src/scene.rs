@@ -54,6 +54,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub raw_shaders: Vec<PaintRawShader>,
 }
 
 #[expect(missing_docs)]
@@ -74,6 +75,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.raw_shaders.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -159,6 +161,7 @@ impl Scene {
                 self.polychrome_sprites[range.start].order
             }
             PrimitiveBatch::Surfaces(range) => self.surfaces[range.start].order,
+            PrimitiveBatch::RawShaders { range, .. } => self.raw_shaders[range.start].order,
         }
     }
 
@@ -242,6 +245,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::RawShader(shader) => {
+                shader.order = order;
+                self.raw_shaders.push(shader.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -281,6 +288,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.raw_shaders.sort_by_key(|shader| shader.order);
     }
 
     #[cfg_attr(
@@ -324,6 +332,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            raw_shaders_start: 0,
+            raw_shaders_iter: self.raw_shaders.iter().peekable(),
         }
     }
 }
@@ -348,6 +358,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    RawShader,
 }
 
 pub(crate) enum PaintOperation {
@@ -831,6 +842,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    RawShader(PaintRawShader),
 }
 
 #[expect(missing_docs)]
@@ -847,6 +859,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::RawShader(shader) => &shader.bounds,
         }
     }
 
@@ -862,6 +875,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::RawShader(shader) => &shader.content_mask,
         }
     }
 }
@@ -896,6 +910,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    raw_shaders_start: usize,
+    raw_shaders_iter: Peekable<slice::Iter<'a, PaintRawShader>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -936,6 +952,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.raw_shaders_iter.peek().map(|s| s.order),
+                PrimitiveKind::RawShader,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -1125,6 +1145,30 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::RawShader => {
+                let first = self.raw_shaders_iter.peek().expect("a shader is next");
+                let (program, image) = (first.program, first.image_texture());
+                let raw_shaders_start = self.raw_shaders_start;
+                let mut raw_shaders_end = raw_shaders_start + 1;
+                self.raw_shaders_iter.next();
+                while self
+                    .raw_shaders_iter
+                    .next_if(|shader| {
+                        (shader.order, batch_kind) < max_order_and_kind
+                            && std::ptr::eq(shader.program, program)
+                            && shader.image_texture() == image
+                    })
+                    .is_some()
+                {
+                    raw_shaders_end += 1;
+                }
+                self.raw_shaders_start = raw_shaders_end;
+                Some(PrimitiveBatch::RawShaders {
+                    program,
+                    image,
+                    range: raw_shaders_start..raw_shaders_end,
+                })
+            }
         }
     }
 }
@@ -1163,6 +1207,12 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    RawShaders {
+        program: &'static RawShaderProgram,
+        /// The atlas texture holding the image every shader in the batch reads, if any.
+        image: Option<AtlasTextureId>,
+        range: Range<usize>,
+    },
 }
 
 impl PrimitiveBatch {
@@ -1199,6 +1249,9 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::RawShaders { program, range, .. } => {
+                format!("{} shaders ({})", program.name, range.len())
+            }
         }
     }
 }
@@ -1511,6 +1564,113 @@ pub struct PaintSurface {
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
+    }
+}
+
+/// How many numbers a shader is given with each rectangle it draws, as `params` in
+/// [`RawShaderInstance`].
+pub const RAW_SHADER_PARAMS: usize = 16;
+
+/// A shader an app wrote, which draws a rectangle of a window with
+/// [`Window::paint_raw_shader`](crate::Window::paint_raw_shader).
+///
+/// `wgsl` is one WGSL module with a `vs_main` vertex and a `fs_main` fragment entry
+/// point, drawn as a four-vertex triangle strip per rectangle. It reads the window
+/// globals at `@group(0) @binding(0)` as `{ viewport_size: vec2<f32>,
+/// premultiplied_alpha: u32, time: f32 }`, where `time` is seconds since the window's
+/// renderer started, and each rectangle's [`RawShaderInstance`] from `@group(1)
+/// @binding(0) var<storage, read> instances: array<RawShaderInstance>` at the instance
+/// index. The fragment returns a colour with straight alpha, premultiplied when
+/// `premultiplied_alpha` is set, and should discard what falls outside the instance's
+/// `clip`.
+///
+/// A shader that moves with `time` animates without any view drawing again: call
+/// [`Window::present_shaders`](crate::Window::present_shaders) for each frame it should show.
+///
+/// A rectangle painted with an image can read it as GPUI's own sprites do, from
+/// `@group(2) @binding(0) var image: texture_2d<f32>` with `@group(2) @binding(1) var
+/// image_sampler: sampler`, at the texels the instance's `image` names. A program is
+/// either always given an image or never.
+///
+/// `msl` is the same module in Metal Shading Language, translated ahead of time, for
+/// example by naga in the app's build script with group 0 binding 0 at buffer 0 and
+/// group 1 binding 0 at buffer 1 for both entry points, the image at texture 0, and the
+/// sampler as an inline one. The Metal renderer compiles it once, the first time the
+/// program draws; the other renderers use `wgsl`.
+#[derive(Debug)]
+pub struct RawShaderProgram {
+    /// Names the program in captures and errors.
+    pub name: &'static str,
+    /// The module in WGSL, for every renderer but Metal.
+    pub wgsl: &'static str,
+    /// The same module in Metal Shading Language.
+    pub msl: &'static str,
+}
+
+/// What a shader is given for each rectangle it draws, in device pixels.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct RawShaderInstance {
+    /// Origin and size of the rectangle.
+    pub bounds: [f32; 4],
+    /// Origin and size of the part of the window it may draw in.
+    pub clip: [f32; 4],
+    /// Origin and size in its atlas texture of the image it reads, in texels; zero without one.
+    pub image: [f32; 4],
+    /// The app's own numbers for this rectangle, such as a time and colours.
+    pub params: [f32; RAW_SHADER_PARAMS],
+}
+
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct PaintRawShader {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub program: &'static RawShaderProgram,
+    pub params: [f32; RAW_SHADER_PARAMS],
+    pub image: Option<AtlasTile>,
+}
+
+impl PaintRawShader {
+    /// The atlas texture its image is in, if it reads one.
+    pub fn image_texture(&self) -> Option<AtlasTextureId> {
+        self.image.as_ref().map(|tile| tile.texture_id)
+    }
+
+    /// The rectangle as its shader reads it.
+    pub fn instance(&self) -> RawShaderInstance {
+        let clip = self.content_mask.bounds;
+        RawShaderInstance {
+            bounds: [
+                self.bounds.origin.x.0,
+                self.bounds.origin.y.0,
+                self.bounds.size.width.0,
+                self.bounds.size.height.0,
+            ],
+            clip: [
+                clip.origin.x.0,
+                clip.origin.y.0,
+                clip.size.width.0,
+                clip.size.height.0,
+            ],
+            image: self.image.as_ref().map_or([0.; 4], |tile| {
+                let bounds = tile.bounds;
+                [
+                    bounds.origin.x.0 as f32,
+                    bounds.origin.y.0 as f32,
+                    bounds.size.width.0 as f32,
+                    bounds.size.height.0 as f32,
+                ]
+            }),
+            params: self.params,
+        }
+    }
+}
+
+impl From<PaintRawShader> for Primitive {
+    fn from(shader: PaintRawShader) -> Self {
+        Primitive::RawShader(shader)
     }
 }
 

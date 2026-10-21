@@ -4,8 +4,9 @@ use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Background, BlurPasses, Bounds, DevicePixels, GAUSSIAN_REACH, GpuSpecs,
-    KAWASE_LEVELS, Kawase, LayerEffect, Path, Point, PrimitiveBatch, ScaledPixels, Scene, ShaderId,
-    Size, get_gamma_correction_ratios,
+    KAWASE_LEVELS, Kawase, LayerEffect, PaintRawShader, Path, Point, PrimitiveBatch,
+    RawShaderInstance, RawShaderProgram, ScaledPixels, Scene, ShaderId, Size,
+    get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -76,7 +77,8 @@ fn least_common_multiple(left: u64, right: u64) -> u64 {
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
-    pad: u32,
+    /// Seconds since the renderer started, for app shaders that animate.
+    time: f32,
 }
 
 #[repr(C)]
@@ -190,6 +192,7 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
+    raw_shaders: InstanceBinding,
 }
 
 struct WgpuBindGroupLayouts {
@@ -232,6 +235,12 @@ struct WgpuResources {
     /// format supports multisampling.
     path_msaa: Option<Scratch>,
     filter_targets: FilterTargets,
+    /// What an app shader draws into, as GPUI's own pipelines blend onto the surface.
+    raw_shader_target: wgpu::ColorTargetState,
+    /// Each app shader's pipeline by its program's address and whether it is given an image,
+    /// made before the first frame it draws in; a module that does not build is reported as
+    /// a device error.
+    raw_shader_pipelines: FxHashMap<(usize, bool), wgpu::RenderPipeline>,
 }
 
 struct CachedTextureBindGroup {
@@ -413,6 +422,7 @@ struct WgpuRendererCore {
     uses_webgl_instance_data: bool,
     /// When the frame being recorded started, which stamps every offscreen target it touches.
     frame_time: Instant,
+    started: Instant,
     /// The size of the target the frame being recorded draws into. Offscreen targets match it,
     /// so they are dropped whenever it changes.
     frame_size: (u32, u32),
@@ -2123,6 +2133,17 @@ impl WgpuRendererCore {
                 path_intermediate: None,
                 path_msaa: None,
                 filter_targets: FilterTargets::default(),
+                raw_shader_target: wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(match alpha_mode {
+                        wgpu::CompositeAlphaMode::PreMultiplied => {
+                            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
+                        }
+                        _ => wgpu::BlendState::ALPHA_BLENDING,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                },
+                raw_shader_pipelines: FxHashMap::default(),
             },
             atlas,
             path_globals_offset,
@@ -2134,6 +2155,7 @@ impl WgpuRendererCore {
             instance_data_window: Instant::now(),
             uses_webgl_instance_data,
             frame_time: Instant::now(),
+            started: Instant::now(),
             frame_size: (0, 0),
             rendering_params,
             is_bgr: false,
@@ -2188,7 +2210,7 @@ impl WgpuRendererCore {
         let globals = GlobalParams {
             viewport_size: [size.width.0 as f32, size.height.0 as f32],
             premultiplied_alpha: premultiplied_alpha as u32,
-            pad: 0,
+            time: self.frame_time.duration_since(self.started).as_secs_f32(),
         };
         let path_globals = GlobalParams {
             premultiplied_alpha: 0,
@@ -2241,6 +2263,7 @@ impl WgpuRendererCore {
                 )
             })?;
         self.prepare_texture_bind_groups(scene);
+        self.prepare_raw_shader_pipelines(scene);
 
         let mut encoder =
             self.resources()
@@ -2490,6 +2513,30 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::RawShaders {
+                        program,
+                        image,
+                        range,
+                    } => {
+                        let key = raw_shader_pipeline_key(program, image.is_some());
+                        if let Some(pipeline) = self.resources().raw_shader_pipelines.get(&key) {
+                            match image {
+                                Some(texture_id) => self.draw_sprites(
+                                    &instance_bindings.raw_shaders,
+                                    texture_id,
+                                    pipeline,
+                                    instance_range(range),
+                                    &mut pass,
+                                )?,
+                                None => self.draw_instances(
+                                    &instance_bindings.raw_shaders,
+                                    pipeline,
+                                    instance_range(range),
+                                    &mut pass,
+                                ),
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2657,6 +2704,76 @@ impl WgpuRendererCore {
                 instance_offset,
                 &scene.polychrome_sprites,
             )?,
+            raw_shaders: self.write_instance_binding(
+                "raw_shaders_bind_group",
+                instance_offset,
+                &scene
+                    .raw_shaders
+                    .iter()
+                    .map(PaintRawShader::instance)
+                    .collect::<Vec<RawShaderInstance>>(),
+            )?,
+        })
+    }
+
+    /// Builds the pipeline of each app shader the scene draws with that has none yet.
+    fn prepare_raw_shader_pipelines(&mut self, scene: &Scene) {
+        // A WebGL target hands instances over in a texture, which an app's module cannot read.
+        if self.uses_webgl_instance_data {
+            return;
+        }
+        for shader in &scene.raw_shaders {
+            let image = shader.image.is_some();
+            let key = raw_shader_pipeline_key(shader.program, image);
+            if self.resources().raw_shader_pipelines.contains_key(&key) {
+                continue;
+            }
+            let pipeline = self.create_raw_shader_pipeline(shader.program, image);
+            self.resources_mut().raw_shader_pipelines.insert(key, pipeline);
+        }
+    }
+
+    fn create_raw_shader_pipeline(&self, program: &RawShaderProgram, image: bool) -> wgpu::RenderPipeline {
+        let resources = self.resources();
+        let device = &resources.device;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(program.name),
+            source: wgpu::ShaderSource::Wgsl(program.wgsl.into()),
+        });
+        let layouts = &resources.bind_group_layouts;
+        let groups = [
+            Some(&layouts.globals),
+            Some(&layouts.instances),
+            Some(&layouts.texture),
+        ];
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(program.name),
+            bind_group_layouts: &groups[..if image { 3 } else { 2 }],
+            immediate_size: 0,
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(program.name),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_main"),
+                targets: &[Some(resources.raw_shader_target.clone())],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
         })
     }
 
@@ -2690,7 +2807,11 @@ impl WgpuRendererCore {
             let texture_id = match batch {
                 PrimitiveBatch::MonochromeSprites { texture_id, .. }
                 | PrimitiveBatch::SubpixelSprites { texture_id, .. }
-                | PrimitiveBatch::PolychromeSprites { texture_id, .. } => texture_id,
+                | PrimitiveBatch::PolychromeSprites { texture_id, .. }
+                | PrimitiveBatch::RawShaders {
+                    image: Some(texture_id),
+                    ..
+                } => texture_id,
                 _ => continue,
             };
             if !texture_ids.contains(&texture_id) {
@@ -3790,6 +3911,10 @@ impl RenderingParameters {
             subpixel_enhanced_contrast,
         }
     }
+}
+
+fn raw_shader_pipeline_key(program: &RawShaderProgram, image: bool) -> (usize, bool) {
+    (program as *const RawShaderProgram as usize, image)
 }
 
 #[cfg(test)]
