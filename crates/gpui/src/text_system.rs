@@ -425,6 +425,7 @@ impl TextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    letter_spacing: LetterSpacing::default(),
                 }],
             )
             .width
@@ -831,6 +832,7 @@ impl WindowTextSystem {
                 let font_id = self.resolve_font(&run.font);
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
+                    && run.font.letter_spacing == font_run.letter_spacing
                     && !decoration_changed
                 {
                     font_run.len += run_len_within_line;
@@ -838,6 +840,7 @@ impl WindowTextSystem {
                     font_runs.push(FontRun {
                         len: run_len_within_line,
                         font_id,
+                        letter_spacing: run.font.letter_spacing,
                     });
                 }
 
@@ -945,6 +948,7 @@ impl WindowTextSystem {
             let font_id = self.resolve_font(&run.font);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.font.letter_spacing == font_run.letter_spacing
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -952,6 +956,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    letter_spacing: run.font.letter_spacing,
                 });
             }
         }
@@ -979,6 +984,7 @@ impl WindowTextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    letter_spacing: LetterSpacing::default(),
                 }],
                 None,
             )
@@ -1027,6 +1033,7 @@ impl WindowTextSystem {
             let font_id = self.resolve_font(&run.font);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.font.letter_spacing == font_run.letter_spacing
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -1034,6 +1041,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    letter_spacing: run.font.letter_spacing,
                 });
             }
         }
@@ -1089,6 +1097,7 @@ impl WindowTextSystem {
             let font_id = self.resolve_font(&run.font);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.font.letter_spacing == font_run.letter_spacing
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -1096,6 +1105,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    letter_spacing: run.font.letter_spacing,
                 });
             }
         }
@@ -1239,6 +1249,21 @@ impl schemars::JsonSchema for FontWeight {
     }
 }
 
+/// Extra space after each character, in ems of the font size, like CSS `letter-spacing`.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(transparent)]
+pub struct LetterSpacing(pub f32);
+
+impl Hash for LetterSpacing {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u32(self.0.to_bits());
+    }
+}
+
+impl Eq for LetterSpacing {}
+
 /// Allows italic or oblique faces to be selected.
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default, Serialize, Deserialize, JsonSchema)]
 pub enum FontStyle {
@@ -1340,6 +1365,9 @@ pub struct Font {
 
     /// The font style.
     pub style: FontStyle,
+
+    /// The space added after each character.
+    pub letter_spacing: LetterSpacing,
 }
 
 impl Default for Font {
@@ -1356,6 +1384,7 @@ pub fn font(family: impl Into<SharedString>) -> Font {
         weight: FontWeight::default(),
         style: FontStyle::default(),
         fallbacks: None,
+        letter_spacing: LetterSpacing::default(),
     }
 }
 
