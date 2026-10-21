@@ -5542,6 +5542,58 @@ impl Window {
         });
     }
 
+    /// Paints `bounds` with an app's own shader, which is given `params` for this
+    /// rectangle along with where it is, and `image` for a program that reads one; see
+    /// [`ShaderProgram`](crate::ShaderProgram) for what the shader is handed. Rectangles
+    /// drawn with one program and image in a row are drawn together.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_shader(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        program: &'static crate::ShaderProgram,
+        params: [f32; crate::SHADER_PARAMS],
+        image: Option<&Arc<RenderImage>>,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let image = match image {
+            Some(data) => {
+                let params = RenderImageParams {
+                    image_id: data.id,
+                    frame_index: 0,
+                };
+                self.sprite_atlas
+                    .get_or_insert_with(params.into(), &mut || {
+                        Ok(Some((
+                            data.size(0),
+                            Cow::Borrowed(data.as_bytes(0).expect("an image has a first frame")),
+                        )))
+                    })?
+            }
+            None => None,
+        };
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(crate::PaintShader {
+            order: 0,
+            bounds,
+            content_mask,
+            program,
+            params,
+            image,
+        });
+        Ok(())
+    }
+
+    /// Shows the last frame again with the shaders' `time` moved on, without rendering,
+    /// laying out or painting any view; see [`ShaderProgram`](crate::ShaderProgram).
+    pub fn present_shaders(&self) {
+        self.needs_present.set(true);
+        self.platform_window.schedule_frame();
+        self.invalidator.wake_platform();
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {
