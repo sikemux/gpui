@@ -11,7 +11,7 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, Filter, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayerFilter, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    Keystroke, KeystrokeEvent, LayerFilter, LayoutId, LineLayoutIndex, ModifierSides, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
@@ -3468,6 +3468,12 @@ impl Window {
     /// The current state of the keyboard's modifiers
     pub fn modifiers(&self) -> Modifiers {
         self.modifiers
+    }
+
+    /// Which side of the keyboard each held modifier is on, where the platform can tell,
+    /// such as right Option held alone on a Mac.
+    pub fn modifier_sides(&self) -> ModifierSides {
+        self.platform_window.modifier_sides()
     }
 
     /// Returns true if the last input event was keyboard-based (key press, tab navigation, etc.)
