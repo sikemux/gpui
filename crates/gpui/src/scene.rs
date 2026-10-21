@@ -1509,8 +1509,8 @@ pub const SHADER_PARAMS: usize = 16;
 ///
 /// `msl` is the same module in Metal Shading Language, translated ahead of time, for
 /// example by naga in the app's build script with group 0 binding 0 at buffer 0 and
-/// group 1 binding 0 at buffer 1 for both entry points, the image at texture 0, and the
-/// sampler as an inline one. The Metal renderer compiles it once, the first time the
+/// group 1 binding 0 at buffer 1 for both entry points, the size of the instances at
+/// buffer 2, the image at texture 0, and the sampler as an inline one. The Metal renderer compiles it once, the first time the
 /// program draws; the other renderers use `wgsl`.
 #[derive(Debug)]
 pub struct ShaderProgram {

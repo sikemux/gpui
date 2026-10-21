@@ -2094,6 +2094,11 @@ impl MetalRenderer {
         if let Some(texture) = &texture {
             command_encoder.set_fragment_texture(0, Some(texture));
         }
+        let sizes = [(range.end * mem::size_of::<gpui::ShaderInstance>()) as u32];
+        let sizes_size = mem::size_of_val(&sizes) as u64;
+        let sizes_ptr = sizes.as_ptr() as *const c_void;
+        command_encoder.set_vertex_bytes(2, sizes_size, sizes_ptr);
+        command_encoder.set_fragment_bytes(2, sizes_size, sizes_ptr);
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::TriangleStrip,
             0,
