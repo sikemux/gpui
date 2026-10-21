@@ -592,6 +592,20 @@ impl MetalRenderer {
             .unwrap_or(ptr::null_mut())
     }
 
+    /// A transparent renderer on the same device and atlas, for a plane drawn above native views.
+    pub fn new_overlay(&self) -> Self {
+        let layer = metal::MetalLayer::new();
+        Self::configure_layer(&layer, &self.device, true, false);
+        let mut renderer = Self::new_internal(
+            self.device.clone(),
+            Some(layer),
+            false,
+            self.instance_buffer_pool.clone(),
+        );
+        renderer.sprite_atlas = self.sprite_atlas.clone();
+        renderer
+    }
+
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
     }

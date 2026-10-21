@@ -1062,6 +1062,8 @@ pub(crate) struct Frame {
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
+    overlay_scene_start: usize,
+    overlay_input: Vec<Bounds<Pixels>>,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
@@ -1119,6 +1121,8 @@ impl Frame {
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
+            overlay_scene_start: 0,
+            overlay_input: Vec::new(),
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
@@ -1146,6 +1150,8 @@ impl Frame {
         self.mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
+        self.overlay_scene_start = 0;
+        self.overlay_input.clear();
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
@@ -3683,6 +3689,11 @@ impl Window {
         self.invalidator.replace_views(views);
     }
 
+    /// Lets native child views sit between the root's drawing and deferred draws.
+    pub fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        self.platform_window.enable_scene_overlay()
+    }
+
     #[profiling::function]
     fn present(&mut self) {
         #[cfg(feature = "profiler")]
@@ -3690,7 +3701,11 @@ impl Window {
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         let frame_stats_present = crate::frame_stats::start();
-        self.platform_window.draw(&self.rendered_frame.scene);
+        self.platform_window.draw_layered(
+            &self.rendered_frame.scene,
+            self.rendered_frame.overlay_scene_start,
+            &self.rendered_frame.overlay_input,
+        );
         crate::frame_stats::record(crate::frame_stats::Phase::Present, frame_stats_present);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
@@ -3896,7 +3911,9 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
+        let overlay_hitboxes = self.next_frame.hitboxes.len();
         self.prepaint_deferred_draws(cx);
+        let mut overlay_hitboxes_end = None;
 
         let mut prompt_element = None;
         let mut active_drag_element = None;
@@ -3918,8 +3935,21 @@ impl Window {
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
         } else {
+            // A tooltip is passive, so it leaves the pointer to a native view under it.
+            overlay_hitboxes_end = Some(self.next_frame.hitboxes.len());
             tooltip_element = self.prepaint_tooltip(cx);
         }
+        self.next_frame.overlay_input = if prompt_element.is_some() || active_drag_element.is_some()
+        {
+            vec![Bounds::new(Point::default(), root_size)]
+        } else {
+            let end = overlay_hitboxes_end.unwrap_or(self.next_frame.hitboxes.len());
+            self.next_frame.hitboxes[overlay_hitboxes..end]
+                .iter()
+                .map(|hitbox| hitbox.bounds.intersect(&hitbox.content_mask.bounds))
+                .filter(|bounds| !bounds.is_empty())
+                .collect()
+        };
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
@@ -3936,6 +3966,7 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
 
+        self.next_frame.overlay_scene_start = self.next_frame.scene.len();
         self.paint_deferred_draws(cx);
 
         if let Some(mut prompt_element) = prompt_element {

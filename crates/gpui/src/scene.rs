@@ -74,6 +74,12 @@ impl Scene {
         self.surfaces.clear();
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.paint_operations
+            .iter()
+            .all(|op| matches!(op, PaintOperation::StartLayer(_) | PaintOperation::EndLayer))
+    }
+
     pub fn len(&self) -> usize {
         self.paint_operations.len()
     }

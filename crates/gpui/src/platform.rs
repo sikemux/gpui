@@ -1305,6 +1305,20 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Draws the scene from `overlay_start` on a plane above native child views, when enabled.
+    /// The plane takes the pointer only inside `overlay_input`, so a native view keeps the rest.
+    fn draw_layered(
+        &self,
+        scene: &Scene,
+        _overlay_start: usize,
+        _overlay_input: &[Bounds<Pixels>],
+    ) {
+        self.draw(scene);
+    }
+    /// Adds a transparent plane above native child views for deferred draws.
+    fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        anyhow::bail!("scene overlays are not supported on this platform")
+    }
     fn schedule_frame(&self) {}
     /// Whether presenting an unchanged frame keeps the display at its full refresh rate, so the
     /// window goes on presenting for a moment after high-rate input. A compositor that only
