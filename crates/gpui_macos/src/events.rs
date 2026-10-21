@@ -1,6 +1,6 @@
 use gpui::{
-    Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
+    Capslock, KeyDownEvent, KeyUpEvent, Keystroke, ModifierSides, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
     NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
     ScrollEvent, ScrollSource, TouchPhase, point, px,
 };
@@ -105,6 +105,39 @@ fn read_modifiers(native_event: &NSEvent) -> Modifiers {
         shift,
         platform: command,
         function,
+    }
+}
+
+/// The sides of the keyboard each held modifier is on, from the event's device flags.
+pub(crate) unsafe fn read_modifier_sides(native_event: *mut AnyObject) -> ModifierSides {
+    const LEFT_CONTROL: u64 = 0x0001;
+    const LEFT_SHIFT: u64 = 0x0002;
+    const RIGHT_SHIFT: u64 = 0x0004;
+    const LEFT_COMMAND: u64 = 0x0008;
+    const RIGHT_COMMAND: u64 = 0x0010;
+    const LEFT_OPTION: u64 = 0x0020;
+    const RIGHT_OPTION: u64 = 0x0040;
+    const RIGHT_CONTROL: u64 = 0x2000;
+    let Some(native_event) = (unsafe { native_event.cast::<NSEvent>().as_ref() }) else {
+        return ModifierSides::default();
+    };
+    let flags = native_event.modifierFlags().bits() as u64;
+    let held = |mask: u64| flags & mask != 0;
+    ModifierSides {
+        left: Modifiers {
+            control: held(LEFT_CONTROL),
+            alt: held(LEFT_OPTION),
+            shift: held(LEFT_SHIFT),
+            platform: held(LEFT_COMMAND),
+            function: false,
+        },
+        right: Modifiers {
+            control: held(RIGHT_CONTROL),
+            alt: held(RIGHT_OPTION),
+            shift: held(RIGHT_SHIFT),
+            platform: held(RIGHT_COMMAND),
+            function: false,
+        },
     }
 }
 
