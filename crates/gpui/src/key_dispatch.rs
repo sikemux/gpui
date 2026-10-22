@@ -68,6 +68,13 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DispatchNodeId(usize);
 
+impl DispatchNodeId {
+    /// The node at a new index worked out from its old one.
+    pub(crate) fn moved(self, index: impl FnOnce(usize) -> usize) -> Self {
+        DispatchNodeId(index(self.0))
+    }
+}
+
 pub(crate) struct DispatchTree {
     node_stack: Vec<DispatchNodeId>,
     pub(crate) context_stack: Vec<KeyContext>,
@@ -105,6 +112,11 @@ impl ReusedSubtree {
             self.old_range
         );
         DispatchNodeId((node_id.0 - self.old_range.start) + self.new_range.start)
+    }
+
+    /// Whether `node`, from the source tree, was copied.
+    pub fn holds(&self, node: DispatchNodeId) -> bool {
+        self.old_range.contains(&node.0)
     }
 
     pub fn contains_focus(&self) -> bool {
@@ -304,6 +316,57 @@ impl DispatchTree {
             old_range,
             new_range,
             contains_focus,
+        }
+    }
+
+    /// Copies the nodes in `old_range` from `source`, each under the node `parent` says its old
+    /// parent now is, for a frame that keeps all but some views of the last one. Unlike
+    /// [`Self::reuse_subtree`], the range may start and end at any depth. Answers whether the
+    /// copied nodes hold `focus`.
+    pub fn splice(
+        &mut self,
+        old_range: Range<usize>,
+        source: &mut Self,
+        focus: Option<FocusId>,
+        parent: impl Fn(DispatchNodeId) -> DispatchNodeId,
+    ) -> bool {
+        let mut contains_focus = false;
+        for index in old_range {
+            let source_node = &mut source.nodes[index];
+            self.open_node(source_node.parent.map(&parent));
+            if source_node.focus_id.is_some() && source_node.focus_id == focus {
+                contains_focus = true;
+            }
+            self.move_node(source_node);
+        }
+        contains_focus
+    }
+
+    /// Makes `node` the one new nodes go under, closing any opened after it, or closes every
+    /// node for `None`.
+    pub fn open_node(&mut self, node: Option<DispatchNodeId>) {
+        if self.node_stack.last().copied() == node {
+            return;
+        }
+        match node {
+            Some(node) if self.node_stack.contains(&node) => {
+                while self.node_stack.last() != Some(&node) {
+                    self.pop_node();
+                }
+            }
+            _ => {
+                self.close_all();
+                if let Some(node) = node {
+                    self.set_active_node(node);
+                }
+            }
+        }
+    }
+
+    /// Closes every open node, as at the end of a frame's prepaint.
+    pub fn close_all(&mut self) {
+        while !self.node_stack.is_empty() {
+            self.pop_node();
         }
     }
 

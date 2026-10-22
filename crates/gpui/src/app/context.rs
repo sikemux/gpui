@@ -222,6 +222,18 @@ impl<'a, T: 'static> Context<'a, T> {
         self.app.notify(self.entity_state.entity_id);
     }
 
+    /// Draws this entity's view again in the place it was last drawn, leaving every view around
+    /// it as it was, which costs only this view's own render rather than its ancestors'. It suits
+    /// a view that changes often without moving, such as a blinking cursor or a running clock.
+    /// Observers aren't told.
+    ///
+    /// When the view wasn't drawn in the last frame, or comes out a different size or needing
+    /// more room than it had, the window draws as after [`Self::notify`], so a caller needn't
+    /// check which it gets.
+    pub fn repaint(&mut self) {
+        self.app.repaint(self.entity_state.entity_id);
+    }
+
     /// Spawn the future returned by the given function.
     /// The function is provided a weak handle to the entity owned by this context and a context that can be held across await points.
     /// The returned task must be held or detached.

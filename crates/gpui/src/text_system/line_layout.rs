@@ -715,6 +715,30 @@ impl LineLayoutCache {
         }
     }
 
+    /// Keeps every layout the last frame used, at the same indices, for a frame that keeps most
+    /// of the last one as it was. Call it before the frame lays anything out.
+    pub fn reuse_all_layouts(&self) {
+        let font_generation = self.clear_if_font_generation_changed();
+        let end = {
+            let previous_frame = self.previous_frame.lock();
+            LineLayoutIndex {
+                font_generation,
+                lines_index: previous_frame.used_lines.len(),
+                wrapped_lines_index: previous_frame.used_wrapped_lines.len(),
+                lines_by_hash_index: previous_frame.used_lines_by_hash.len(),
+                wrapped_lines_by_hash_index: previous_frame.used_wrapped_lines_by_hash.len(),
+            }
+        };
+        let start = LineLayoutIndex {
+            font_generation,
+            lines_index: 0,
+            wrapped_lines_index: 0,
+            lines_by_hash_index: 0,
+            wrapped_lines_by_hash_index: 0,
+        };
+        self.reuse_layouts(start..end);
+    }
+
     pub fn truncate_layouts(&self, index: LineLayoutIndex) {
         let font_generation = self.clear_if_font_generation_changed();
         if index.font_generation != font_generation {
