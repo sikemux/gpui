@@ -736,6 +736,11 @@ struct MacWindowState {
     overlay_view: Option<NonNull<AnyObject>>,
     overlay_input: Arc<Mutex<Vec<Bounds<Pixels>>>>,
     overlay_size: Option<(Size<Pixels>, f32)>,
+    /// The layer behind the drawing that shows the window's ground, made the first time a
+    /// frame has one.
+    ground_renderer: Option<renderer::Renderer>,
+    ground_view: Option<NonNull<AnyObject>>,
+    ground_size: Option<Size<Pixels>>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -1014,6 +1019,71 @@ impl MacWindowState {
         size(px(width as f32), px(height as f32))
     }
 
+    /// Draws the scene's ground into the layer behind the drawing, one pixel per point, or
+    /// hides that layer when the scene has no ground.
+    fn draw_ground(&mut self, scene: &gpui::Scene) {
+        let Some(ground) = scene.ground else {
+            if let Some(view) = self.ground_view.take() {
+                unsafe {
+                    let _: () = msg_send![view.as_ptr(), removeFromSuperview];
+                }
+                self.ground_renderer = None;
+                self.ground_size = None;
+                let opaque = self.background_appearance == WindowBackgroundAppearance::Opaque;
+                self.renderer.update_transparency(!opaque);
+            }
+            return;
+        };
+        if self.ground_view.is_none() {
+            self.add_ground_layer();
+        }
+        let size = self.content_size();
+        let scale = self.scale_factor();
+        let opaque =
+            self.background_appearance == WindowBackgroundAppearance::Opaque && ground.a >= 1.;
+        let Some(renderer) = self.ground_renderer.as_mut() else {
+            return;
+        };
+        if self.ground_size != Some(size) {
+            renderer.update_drawable_size(size.to_device_pixels(1.));
+            self.ground_size = Some(size);
+        }
+        renderer.update_transparency(!opaque);
+        renderer.draw_ground(ground, &scene.ground_shaders, 1. / scale);
+    }
+
+    fn add_ground_layer(&mut self) {
+        let renderer = self.renderer.new_ground();
+        unsafe {
+            let content_view: *mut AnyObject = msg_send![self.native_window, contentView];
+            let frame: NSRect = msg_send![content_view, bounds];
+            let view: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
+            if view.is_null() {
+                log::error!("could not create the window's ground view");
+                return;
+            }
+            let layer = renderer.layer_ptr().cast::<AnyObject>();
+            if !layer.is_null() {
+                let _: () = msg_send![layer, setContentsScale: 1.0f64];
+            }
+            let _: () = msg_send![view, setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable];
+            let _: () = msg_send![view, setLayer: layer];
+            let _: () = msg_send![view, setWantsLayer: Bool::YES];
+            let _: () = msg_send![
+                content_view,
+                addSubview: view,
+                positioned: NSWindowOrderingMode::Below,
+                relativeTo: self.native_view.as_ptr()
+            ];
+            let view: *mut AnyObject = msg_send![view, autorelease];
+            self.ground_view = NonNull::new(view);
+        }
+        self.ground_renderer = Some(renderer);
+        self.renderer.update_transparency(true);
+    }
+
     fn scale_factor(&self) -> f32 {
         get_scale_factor(self.native_window)
     }
@@ -1182,6 +1252,9 @@ impl MacWindow {
                 overlay_view: None,
                 overlay_input: Arc::default(),
                 overlay_size: None,
+                ground_renderer: None,
+                ground_view: None,
+                ground_size: None,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -1950,7 +2023,8 @@ impl PlatformWindow for MacWindow {
         this.background_appearance = background_appearance;
 
         let opaque = background_appearance == WindowBackgroundAppearance::Opaque;
-        this.renderer.update_transparency(!opaque);
+        let grounded = this.ground_view.is_some();
+        this.renderer.update_transparency(!opaque || grounded);
 
         unsafe {
             let _: () = msg_send![this.native_window, setOpaque: opaque.to_objc()];
@@ -2208,7 +2282,16 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
+        this.draw_ground(scene);
         this.renderer.draw(scene);
+    }
+
+    fn supports_ground(&self) -> bool {
+        true
+    }
+
+    fn draw_ground(&self, scene: &gpui::Scene) {
+        self.0.lock().draw_ground(scene);
     }
 
     fn draw_layered(
@@ -2218,6 +2301,7 @@ impl PlatformWindow for MacWindow {
         overlay_input: &[Bounds<Pixels>],
     ) {
         let mut state = self.0.lock();
+        state.draw_ground(scene);
         if state.overlay_renderer.is_none() {
             state.renderer.draw(scene);
             return;

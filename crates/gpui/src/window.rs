@@ -1520,6 +1520,12 @@ pub struct Window {
     /// Set when a frame drawn in part couldn't keep every record of the last one right, so
     /// the next frame draws everything.
     redraw_everything: bool,
+    /// Whether the ground's shaders should be shown again with their clock moved on.
+    needs_ground_present: Rc<Cell<bool>>,
+    /// What fills the window behind everything it paints.
+    ground: Option<Hsla>,
+    /// Whether the platform keeps the ground in a layer of its own.
+    ground_layer: bool,
     /// When the window last presented, by the executor's clock.
     last_present: Instant,
     /// Whether a task is already waiting to free the renderer's idle GPU memory.
@@ -1904,6 +1910,8 @@ impl Window {
         profiler::journal::record_window_visibility(handle.window_id(), visibility);
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
+        let needs_ground_present = Rc::new(Cell::new(false));
+        let ground_layer = platform_window.supports_ground();
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
@@ -2018,6 +2026,7 @@ impl Window {
             let invalidator = invalidator.clone();
             let active = active.clone();
             let needs_present = needs_present.clone();
+            let needs_ground_present = needs_ground_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             let mut deferred_force_render = false;
@@ -2180,6 +2189,10 @@ impl Window {
                             window.present();
                             window.arm_idle_gpu_release(cx);
                         })
+                        .log_err();
+                } else if needs_ground_present.get() {
+                    handle
+                        .update(&mut cx, |_, window, _| window.present_ground_layer())
                         .log_err();
                 }
 
@@ -2455,6 +2468,9 @@ impl Window {
             prepaint_holes: Vec::new(),
             paint_holes: Vec::new(),
             redraw_everything: false,
+            needs_ground_present,
+            ground: None,
+            ground_layer,
             last_present: cx.background_executor().now(),
             idle_gpu_release_armed: false,
             input_rate_tracker,
@@ -4211,6 +4227,7 @@ impl Window {
             &self.rendered_frame.overlay_input,
         );
         crate::frame_stats::record(crate::frame_stats::Phase::Present, frame_stats_present);
+        self.needs_ground_present.set(false);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -4479,6 +4496,7 @@ impl Window {
         crate::frame_stats::record(crate::frame_stats::Phase::Prepaint, frame_stats_prepaint);
         let frame_stats_paint = crate::frame_stats::start();
         self.invalidator.set_phase(DrawPhase::Paint);
+        self.paint_ground();
         let root_paint_start = self.paint_index();
         match (&mut root_element, &mut repaints) {
             (Some(root_element), _) => root_element.paint(self, cx),
@@ -6215,6 +6233,18 @@ impl Window {
         params: [f32; crate::SHADER_PARAMS],
         image: Option<&Arc<RenderImage>>,
     ) -> Result<()> {
+        let shader = self.shader(bounds, program, params, image)?;
+        self.next_frame.scene.insert_primitive(shader);
+        Ok(())
+    }
+
+    fn shader(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        program: &'static crate::ShaderProgram,
+        params: [f32; crate::SHADER_PARAMS],
+        image: Option<&Arc<RenderImage>>,
+    ) -> Result<crate::PaintShader> {
         self.invalidator.debug_assert_paint();
 
         let image = match image {
@@ -6235,15 +6265,14 @@ impl Window {
         };
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
-        self.next_frame.scene.insert_primitive(crate::PaintShader {
+        Ok(crate::PaintShader {
             order: 0,
             bounds,
             content_mask,
             program,
             params,
             image,
-        });
-        Ok(())
+        })
     }
 
     /// Shows the last frame again with the shaders' `time` moved on, without rendering,
@@ -6252,6 +6281,80 @@ impl Window {
         self.needs_present.set(true);
         self.platform_window.schedule_frame();
         self.invalidator.wake_platform();
+    }
+
+    /// Fills the window with `color` behind everything it paints, or leaves it to the
+    /// window's background with `None`. Where the platform keeps the ground in a layer of
+    /// its own, shaders painted with [`Self::paint_ground_shader`] draw there and move on
+    /// with [`Self::present_ground`] alone, so nothing over them is drawn again.
+    pub fn set_ground(&mut self, color: Option<Hsla>) {
+        if self.ground != color {
+            self.ground = color;
+            self.refresh();
+        }
+    }
+
+    /// Paints `bounds` of the window's ground with an app's own shader, behind everything
+    /// else, as [`Self::paint_shader`] does over it. The ground is drawn at one pixel per
+    /// point where it has a layer of its own, so a shader that works in device pixels
+    /// should scale by [`Self::ground_scale`] rather than the window's scale factor.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_ground_shader(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        program: &'static crate::ShaderProgram,
+        params: [f32; crate::SHADER_PARAMS],
+        image: Option<&Arc<RenderImage>>,
+    ) -> Result<()> {
+        let shader = self.shader(bounds, program, params, image)?;
+        match self.ground_layer {
+            true => self
+                .next_frame
+                .scene
+                .insert_primitive(crate::Primitive::GroundShader(shader)),
+            false => self.next_frame.scene.insert_primitive(shader),
+        }
+        Ok(())
+    }
+
+    /// How many device pixels the ground's shaders draw per point.
+    pub fn ground_scale(&self) -> f32 {
+        match self.ground_layer {
+            true => 1.,
+            false => self.scale_factor(),
+        }
+    }
+
+    /// Shows the ground's shaders again with their `time` moved on. Where the ground has
+    /// no layer of its own, this presents the whole frame as [`Self::present_shaders`].
+    pub fn present_ground(&self) {
+        match self.ground_layer {
+            true => self.needs_ground_present.set(true),
+            false => self.needs_present.set(true),
+        }
+        self.platform_window.schedule_frame();
+        self.invalidator.wake_platform();
+    }
+
+    fn present_ground_layer(&mut self) {
+        let start = crate::frame_stats::start();
+        self.platform_window.draw_ground(&self.rendered_frame.scene);
+        crate::frame_stats::record(crate::frame_stats::Phase::Present, start);
+        self.needs_ground_present.set(false);
+    }
+
+    fn paint_ground(&mut self) {
+        let Some(ground) = self.ground else {
+            return;
+        };
+        match self.ground_layer {
+            true => self.next_frame.scene.ground = Some(ground),
+            false => self.paint_quad(fill(
+                Bounds::new(Point::default(), self.viewport_size),
+                ground,
+            )),
+        }
     }
 
     /// Removes an image from the sprite atlas.

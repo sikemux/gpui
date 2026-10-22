@@ -1323,6 +1323,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {
         anyhow::bail!("scene overlays are not supported on this platform")
     }
+    /// Whether the window keeps its ground in a layer behind its drawing, drawn at one pixel
+    /// per point, so [`Self::draw_ground`] can show the ground's shaders moving on alone.
+    /// Without one, the window paints its ground into the scene instead.
+    fn supports_ground(&self) -> bool {
+        false
+    }
+    /// Draws the scene's ground and the shaders painted on it, and nothing else.
+    fn draw_ground(&self, _scene: &Scene) {}
     fn schedule_frame(&self) {}
     /// Whether presenting an unchanged frame keeps the display at its full refresh rate, so the
     /// window goes on presenting for a moment after high-rate input. A compositor that only

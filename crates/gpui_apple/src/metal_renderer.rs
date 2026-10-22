@@ -4,8 +4,8 @@ use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, DevicePixels, GAUSSIAN_REACH,
-    KAWASE_LEVELS, Kawase, LayerEffect, PaintShader, PaintSurface, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, ShaderProgram, Size, point, size,
+    Hsla, KAWASE_LEVELS, Kawase, LayerEffect, PaintShader, PaintSurface, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, ShaderProgram, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -612,6 +612,111 @@ impl MetalRenderer {
         renderer
     }
 
+    /// A renderer on the same device, atlas and clock for the layer behind the window's drawing,
+    /// which shows only the ground and its shaders.
+    pub fn new_ground(&self) -> Self {
+        let layer = metal::MetalLayer::new();
+        Self::configure_layer(&layer, &self.device, true, false);
+        let mut renderer = Self::new_internal(
+            self.device.clone(),
+            Some(layer),
+            false,
+            self.instance_buffer_pool.clone(),
+        );
+        renderer.sprite_atlas = self.sprite_atlas.clone();
+        renderer.started = self.started;
+        renderer
+    }
+
+    /// Fills the layer with `color` and draws `shaders` over it, their bounds scaled by
+    /// `scale` from the window's device pixels to the layer's.
+    pub fn draw_ground(&mut self, color: Hsla, shaders: &[PaintShader], scale: f32) {
+        let Some(layer) = self.layer.clone() else {
+            return;
+        };
+        let drawable_size = layer.drawable_size();
+        let viewport_size: Size<DevicePixels> = size(
+            (drawable_size.width.ceil() as i32).into(),
+            (drawable_size.height.ceil() as i32).into(),
+        );
+        let Some(drawable) = layer.next_drawable() else {
+            log::error!("failed to retrieve the ground's next drawable");
+            return;
+        };
+        let mut writer = InstanceBufferWriter::new(
+            &self.device,
+            &self.instance_buffer_pool,
+            self.is_unified_memory,
+        );
+        let scaled =
+            |[x, y, width, height]: [f32; 4]| [x * scale, y * scale, width * scale, height * scale];
+        let instances = match writer.write_iter(shaders.iter().map(|shader| {
+            let instance = shader.instance();
+            gpui::ShaderInstance {
+                bounds: scaled(instance.bounds),
+                clip: scaled(instance.clip),
+                ..instance
+            }
+        })) {
+            Ok(instances) => instances,
+            Err(error) => {
+                log::error!("the ground's shaders do not fit: {error:#}");
+                return;
+            }
+        };
+        let rgba = color.to_rgb();
+        let clear = metal::MTLClearColor::new(
+            (rgba.r * rgba.a) as f64,
+            (rgba.g * rgba.a) as f64,
+            (rgba.b * rgba.a) as f64,
+            rgba.a as f64,
+        );
+        let command_buffer = self.command_queue.new_command_buffer().to_owned();
+        let command_encoder = new_command_encoder_for_texture(
+            &command_buffer,
+            drawable.texture(),
+            viewport_size,
+            Some(clear),
+        );
+        let mut start = 0;
+        while start < shaders.len() {
+            let (program, image) = (shaders[start].program, shaders[start].image_texture());
+            let end = start
+                + shaders[start..]
+                    .iter()
+                    .take_while(|shader| {
+                        std::ptr::eq(shader.program, program) && shader.image_texture() == image
+                    })
+                    .count();
+            self.draw_shaders(
+                program,
+                image,
+                start..end,
+                &instances,
+                viewport_size,
+                command_encoder,
+            );
+            start = end;
+        }
+        command_encoder.end_encoding();
+        let instance_buffer_pool = self.instance_buffer_pool.clone();
+        let used = writer.offset;
+        let instance_buffer = Cell::new(Some(writer.finish()));
+        instance_buffer_pool.lock().settle(used);
+        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
+            if let Some(instance_buffer) = instance_buffer.take() {
+                instance_buffer_pool.lock().release(instance_buffer);
+            }
+        });
+        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
+        unsafe {
+            command_buffer.add_completed_handler(&*RcBlock::as_ptr(&block).cast());
+        }
+        command_buffer.present_drawable(drawable);
+        command_buffer.commit();
+        gpui::frame_stats::mark_presented();
+    }
+
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
     }
@@ -787,6 +892,7 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        let acquire = gpui::frame_stats::start();
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -796,7 +902,9 @@ impl MetalRenderer {
             );
             return;
         };
+        gpui::frame_stats::record(gpui::frame_stats::Phase::Acquire, acquire);
 
+        let encode = gpui::frame_stats::start();
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
@@ -804,7 +912,9 @@ impl MetalRenderer {
                 return;
             }
         };
+        gpui::frame_stats::record(gpui::frame_stats::Phase::Encode, encode);
 
+        let queue_present = gpui::frame_stats::start();
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
@@ -813,6 +923,8 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        gpui::frame_stats::record(gpui::frame_stats::Phase::QueuePresent, queue_present);
+        gpui::frame_stats::mark_presented();
     }
 
     fn render_frame(
@@ -1214,7 +1326,7 @@ impl MetalRenderer {
                     program,
                     image,
                     range,
-                    instance_bindings,
+                    &instance_bindings.shaders,
                     viewport_size,
                     command_encoder,
                 ),
@@ -2056,7 +2168,7 @@ impl MetalRenderer {
         program: &'static ShaderProgram,
         image: Option<AtlasTextureId>,
         range: Range<usize>,
-        instance_bindings: &InstanceBindings,
+        instances: &InstanceBinding,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
@@ -2088,7 +2200,6 @@ impl MetalRenderer {
         let globals_ptr = &globals as *const ShaderGlobals as *const c_void;
         command_encoder.set_vertex_bytes(0, globals_size, globals_ptr);
         command_encoder.set_fragment_bytes(0, globals_size, globals_ptr);
-        let instances = &instance_bindings.shaders;
         command_encoder.set_vertex_buffer(1, Some(&instances.buffer), instances.offset as u64);
         command_encoder.set_fragment_buffer(1, Some(&instances.buffer), instances.offset as u64);
         if let Some(texture) = &texture {

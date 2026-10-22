@@ -54,6 +54,11 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     pub shaders: Vec<PaintShader>,
+    /// What fills the window behind everything else, on a platform that keeps it in a layer
+    /// of its own; see [`Window::set_ground`](crate::Window::set_ground).
+    pub ground: Option<Hsla>,
+    /// Shaders painted on the ground, drawn over its colour in the order they were painted.
+    pub ground_shaders: Vec<PaintShader>,
 }
 
 #[expect(missing_docs)]
@@ -74,6 +79,8 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.shaders.clear();
+        self.ground = None;
+        self.ground_shaders.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -195,6 +202,13 @@ impl Scene {
             return;
         }
 
+        if let Primitive::GroundShader(shader) = &primitive {
+            self.ground_shaders.push(shader.clone());
+            self.paint_operations
+                .push(PaintOperation::Primitive(primitive));
+            return;
+        }
+
         let order = self
             .layer_stack
             .last()
@@ -242,6 +256,7 @@ impl Scene {
                 shader.order = order;
                 self.shaders.push(shader.clone());
             }
+            Primitive::GroundShader(_) => {}
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -830,6 +845,8 @@ pub enum Primitive {
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
     Shader(PaintShader),
+    /// A shader painted on the window's ground, behind everything else.
+    GroundShader(PaintShader),
 }
 
 #[expect(missing_docs)]
@@ -845,7 +862,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
-            Primitive::Shader(shader) => &shader.bounds,
+            Primitive::Shader(shader) | Primitive::GroundShader(shader) => &shader.bounds,
         }
     }
 
@@ -860,7 +877,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
-            Primitive::Shader(shader) => &shader.content_mask,
+            Primitive::Shader(shader) | Primitive::GroundShader(shader) => &shader.content_mask,
         }
     }
 }
