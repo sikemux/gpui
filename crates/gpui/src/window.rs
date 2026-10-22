@@ -1109,6 +1109,8 @@ pub(crate) struct Frame {
     root_paint: Range<PaintIndex>,
     /// Where each view that may be drawn again in place was drawn; see [`Context::repaint`].
     pub(crate) repaint_sites: FxHashMap<EntityId, RepaintSite>,
+    /// The views drawn as isolated, whose notifies stop at them.
+    pub(crate) isolated: FxHashSet<EntityId>,
 }
 
 /// Where a view that may be drawn again in place was drawn in a frame, and what it was drawn
@@ -1372,6 +1374,7 @@ impl Frame {
             root_prepaint: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             root_paint: PaintIndex::default()..PaintIndex::default(),
             repaint_sites: FxHashMap::default(),
+            isolated: FxHashSet::default(),
         }
     }
 
@@ -1391,6 +1394,7 @@ impl Frame {
         self.deferred_draws.clear();
         self.tab_stops.clear();
         self.repaint_sites.clear();
+        self.isolated.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -2575,6 +2579,25 @@ impl ContentMask<Pixels> {
 }
 
 impl Window {
+    /// Marks a notified view dirty with its ancestors, or, when it is inside a view drawn as
+    /// [`isolated`](crate::ViewElement::isolated), asks for that view to be drawn again in
+    /// place, which draws everything inside it afresh and leaves its ancestors alone.
+    fn notified(&mut self, view_id: EntityId) {
+        let isolated = self
+            .rendered_frame
+            .dispatch_tree
+            .view_path_reversed(view_id)
+            .find(|view| self.rendered_frame.isolated.contains(view));
+        match isolated {
+            Some(isolated) => {
+                #[cfg(feature = "profiler")]
+                self.debug_frame_overlay.note_notified(view_id);
+                self.invalidator.repaint_view(isolated);
+            }
+            None => self.mark_view_dirty(view_id),
+        }
+    }
+
     fn mark_view_dirty(&mut self, view_id: EntityId) {
         // The view named here is the one that changed; everything above it is
         // only dragged along, which is what the repaint wash wants to tell apart.
@@ -3868,6 +3891,14 @@ impl Window {
                     .retain(|entity| drawn.contains_key(entity));
             }
         }
+        let kept: Vec<EntityId> = self
+            .rendered_frame
+            .isolated
+            .iter()
+            .filter(|entity| self.next_frame.repaint_sites.contains_key(*entity))
+            .copied()
+            .collect();
+        self.next_frame.isolated.extend(kept);
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -3982,7 +4013,7 @@ impl Window {
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
         for entity in views.drain() {
-            self.mark_view_dirty(entity);
+            self.notified(entity);
         }
         self.invalidator.replace_views(views);
     }
@@ -4932,6 +4963,13 @@ impl Window {
             })
             .collect();
         self.next_frame.repaint_sites.extend(carried);
+    }
+
+    /// Notes that the view `entity` is drawn isolated this frame; see
+    /// [`ViewElement::isolated`](crate::ViewElement::isolated).
+    pub(crate) fn isolate(&mut self, entity: EntityId) {
+        self.next_frame.isolated.insert(entity);
+        self.repaint_capable.insert(entity);
     }
 
     /// Notes where a view that may be drawn again in place starts to prepaint.
@@ -11553,5 +11591,302 @@ mod repaint_tests {
         pane.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
         assert!(cx.debug_bounds("side").is_some());
+    }
+
+    struct Caret {
+        on: bool,
+    }
+
+    impl Render for Caret {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let on = self.on;
+            div()
+                .w(px(2.))
+                .h(px(10.))
+                .debug_selector(move || if on { "caret-on" } else { "caret-off" }.into())
+        }
+    }
+
+    struct Field {
+        text: String,
+        marked: Option<std::ops::Range<usize>>,
+        height: f32,
+        focus: crate::FocusHandle,
+        caret: crate::Entity<Caret>,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Field {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let (entity, focus) = (cx.entity(), self.focus.clone());
+            div()
+                .id("field")
+                .relative()
+                .w(px(100.))
+                .h(px(self.height))
+                .track_focus(&self.focus)
+                .debug_selector(|| "field".into())
+                .child(self.caret.clone())
+                .child(
+                    crate::canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, cx| {
+                            window.handle_input(
+                                &focus,
+                                crate::ElementInputHandler::new(bounds, entity.clone()),
+                                cx,
+                            )
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
+        }
+    }
+
+    impl crate::EntityInputHandler for Field {
+        fn text_for_range(
+            &mut self,
+            range: std::ops::Range<usize>,
+            _: &mut Option<std::ops::Range<usize>>,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Option<String> {
+            self.text.get(range).map(str::to_owned)
+        }
+
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Option<crate::UTF16Selection> {
+            let end = self.text.len();
+            Some(crate::UTF16Selection {
+                range: end..end,
+                reversed: false,
+            })
+        }
+
+        fn marked_text_range(
+            &self,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Option<std::ops::Range<usize>> {
+            self.marked.clone()
+        }
+
+        fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+            self.marked = None;
+        }
+
+        fn replace_text_in_range(
+            &mut self,
+            _: Option<std::ops::Range<usize>>,
+            text: &str,
+            _: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            if let Some(marked) = self.marked.take() {
+                self.text.truncate(marked.start);
+            }
+            self.text.push_str(text);
+            cx.notify();
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _: Option<std::ops::Range<usize>>,
+            text: &str,
+            _: Option<std::ops::Range<usize>>,
+            _: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let start = self
+                .marked
+                .take()
+                .map_or(self.text.len(), |marked| marked.start);
+            self.text.truncate(start);
+            self.text.push_str(text);
+            self.marked = Some(start..self.text.len());
+            cx.notify();
+        }
+
+        fn bounds_for_range(
+            &mut self,
+            range: std::ops::Range<usize>,
+            element_bounds: crate::Bounds<crate::Pixels>,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Option<crate::Bounds<crate::Pixels>> {
+            Some(crate::Bounds::new(
+                crate::point(
+                    element_bounds.left() + px(range.start as f32 * 10.),
+                    element_bounds.top(),
+                ),
+                crate::size(px(10.), px(20.)),
+            ))
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _: crate::Point<crate::Pixels>,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Option<usize> {
+            None
+        }
+    }
+
+    struct Form {
+        field: crate::Entity<Field>,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Form {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(div().h(px(30.)))
+                .child(self.field.clone().into_element().isolated())
+        }
+    }
+
+    struct FormCounts {
+        form: Rc<Cell<usize>>,
+        field: Rc<Cell<usize>>,
+    }
+
+    fn form(
+        cx: &mut TestAppContext,
+    ) -> (
+        crate::Entity<Form>,
+        crate::Entity<Field>,
+        crate::Entity<Caret>,
+        FormCounts,
+        &mut crate::VisualTestContext,
+    ) {
+        let counts = FormCounts {
+            form: Rc::default(),
+            field: Rc::default(),
+        };
+        let (form_renders, field_renders) = (counts.form.clone(), counts.field.clone());
+        let (form, cx) = cx.add_window_view(|_, cx| {
+            let caret = cx.new(|_| Caret { on: false });
+            Form {
+                field: cx.new(|cx| Field {
+                    text: String::new(),
+                    marked: None,
+                    height: 20.,
+                    focus: cx.focus_handle(),
+                    caret,
+                    renders: field_renders,
+                }),
+                renders: form_renders,
+            }
+        });
+        cx.run_until_parked();
+        let field = form.read_with(cx, |form, _| form.field.clone());
+        let caret = field.read_with(cx, |field, _| field.caret.clone());
+        (form, field, caret, counts, cx)
+    }
+
+    #[gpui::test]
+    fn test_a_notify_inside_an_isolated_view_draws_only_it(cx: &mut TestAppContext) {
+        let (_form, field, caret, counts, cx) = form(cx);
+        let form_renders = counts.form.get();
+        let field_renders = counts.field.get();
+        caret.update(cx, |caret, cx| {
+            caret.on = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("caret-on").is_some(),
+            "the caret drew again"
+        );
+        assert_eq!(
+            counts.field.get(),
+            field_renders + 1,
+            "the isolated view drew again"
+        );
+        assert_eq!(
+            counts.form.get(),
+            form_renders,
+            "nothing above it drew again"
+        );
+
+        let focus = field.read_with(cx, |field, _| field.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.run_until_parked();
+        let origin = cx.debug_bounds("field").unwrap().origin;
+        let form_renders = counts.form.get();
+        let handle = crate::VisualContext::window_handle(cx);
+        let mut window = cx.cx.test_window(handle);
+        for typed in ["n", "ni", "nih", "niha"] {
+            let mut input = crate::PlatformWindow::take_input_handler(&mut window)
+                .expect("the field takes text");
+            input.replace_and_mark_text_in_range(None, typed, None);
+            crate::PlatformWindow::set_input_handler(&mut window, input);
+            cx.run_until_parked();
+            let mut input = crate::PlatformWindow::take_input_handler(&mut window).unwrap();
+            let rect = input.bounds_for_range(1..2).expect("a candidate rect");
+            crate::PlatformWindow::set_input_handler(&mut window, input);
+            assert_eq!(
+                rect.origin,
+                crate::point(origin.x + px(10.), origin.y),
+                "after {typed}"
+            );
+        }
+        let mut input = crate::PlatformWindow::take_input_handler(&mut window).unwrap();
+        input.replace_text_in_range(None, "你好");
+        crate::PlatformWindow::set_input_handler(&mut window, input);
+        cx.run_until_parked();
+        assert_eq!(field.read_with(cx, |field, _| field.text.clone()), "你好");
+        assert_eq!(
+            counts.form.get(),
+            form_renders,
+            "typing drew only the field"
+        );
+    }
+
+    #[gpui::test]
+    fn test_an_isolated_view_that_grows_draws_as_after_notify(cx: &mut TestAppContext) {
+        let (_form, field, _caret, counts, cx) = form(cx);
+        let form_renders = counts.form.get();
+        field.update(cx, |field, cx| {
+            field.height = 40.;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            counts.form.get(),
+            form_renders + 1,
+            "the form laid out again"
+        );
+        assert_eq!(cx.debug_bounds("field").unwrap().size.height, px(40.));
+    }
+
+    #[gpui::test]
+    fn test_an_isolated_notify_beside_another_change_draws_one_whole_frame(
+        cx: &mut TestAppContext,
+    ) {
+        let (form, _field, caret, counts, cx) = form(cx);
+        let form_renders = counts.form.get();
+        caret.update(cx, |caret, cx| {
+            caret.on = true;
+            cx.notify();
+        });
+        form.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(counts.form.get(), form_renders + 1);
+        assert!(cx.debug_bounds("caret-on").is_some());
+        assert!(cx.debug_bounds("field").is_some());
     }
 }
