@@ -2,7 +2,8 @@ use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
     Attrs, AttrsList, Ellipsize, Family, Font as CosmicTextFont,
-    FontFeatures as CosmicFontFeatures, FontSystem, ShapeBuffer, ShapeLine, Stretch, Style, Weight as CosmicWeight,
+    FontFeatures as CosmicFontFeatures, FontSystem, ShapeBuffer, ShapeLine, Stretch, Style,
+    Weight as CosmicWeight,
 };
 use gpui::{
     Bounds, DevicePixels, FallbackFontClass, Font, FontFallbacks, FontFeatures, FontId,
@@ -1090,6 +1091,7 @@ fn clip_font_runs(font_runs: &[FontRun], range: Range<usize>) -> SmallVec<[FontR
                 font_id: run.font_id,
                 letter_spacing: run.letter_spacing,
                 scale: run.scale,
+                leading: Default::default(),
             });
         }
     }
@@ -1500,6 +1502,7 @@ mod tests {
             font_id,
             letter_spacing: Default::default(),
             scale: Default::default(),
+            leading: Default::default(),
         }];
         Ok(text_system.layout_line(text, gpui::px(14.0), &runs))
     }
@@ -1574,6 +1577,7 @@ mod tests {
             font_id,
             letter_spacing: Default::default(),
             scale: Default::default(),
+            leading: Default::default(),
         }];
 
         let missing_glyphs = text_system
@@ -1705,12 +1709,14 @@ mod tests {
                 font_id,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             },
             FontRun {
                 len: "\u{05d1}".len(),
                 font_id,
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             },
         ];
         let layout = text_system.layout_line(text, gpui::px(14.0), &runs);
@@ -1810,12 +1816,14 @@ mod tests {
                 font_id: fid(1),
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             },
             FontRun {
                 len: 4,
                 font_id: fid(2),
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             },
         ];
 
@@ -1828,12 +1836,14 @@ mod tests {
                     font_id: fid(1),
                     letter_spacing: Default::default(),
                     scale: Default::default(),
+                    leading: Default::default(),
                 },
                 FontRun {
                     len: 2,
                     font_id: fid(2),
                     letter_spacing: Default::default(),
                     scale: Default::default(),
+                    leading: Default::default(),
                 },
             ]
         );
@@ -1844,6 +1854,7 @@ mod tests {
                 font_id: fid(2),
                 letter_spacing: Default::default(),
                 scale: Default::default(),
+                leading: Default::default(),
             }]
         );
         assert!(clip_font_runs(&runs, 5..5).is_empty());
