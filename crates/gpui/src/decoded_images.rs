@@ -17,11 +17,14 @@ pub(crate) struct DecodedImages {
     budget: Option<usize>,
 }
 
+/// What a picture costs once drawn: its pixels, and the texture of the same size a window
+/// draws them from.
 fn size_of(image: &RenderImage) -> usize {
-    (0..image.frame_count())
+    let pixels: usize = (0..image.frame_count())
         .filter_map(|frame| image.as_bytes(frame))
         .map(<[u8]>::len)
-        .sum()
+        .sum();
+    pixels * 2
 }
 
 impl DecodedImages {
@@ -42,13 +45,17 @@ impl DecodedImages {
 }
 
 impl App {
-    /// Holds decoded pictures to `bytes` in all: once a frame leaves more than that loaded,
-    /// the least recently drawn that no window shows are dropped until it fits.
+    /// Holds decoded pictures, with the textures drawn from them, to `bytes` in all: once a
+    /// frame leaves more than that loaded, the least recently drawn that no window shows are
+    /// dropped until it fits.
     pub fn set_decoded_image_budget(&mut self, bytes: usize) {
         self.decoded_images.budget = Some(bytes);
     }
 
-    pub(crate) fn decoded_image_drawn<A: crate::Asset>(
+    /// Counts a picture an app's own [`crate::Asset`] decoded, and drew this frame, against the
+    /// budget, as `img` counts its own: past the budget, it is let go once no window shows it,
+    /// and [`crate::Window::use_asset`] decodes it again when it is drawn later.
+    pub fn decoded_image_drawn<A: crate::Asset>(
         &mut self,
         source: &A::Source,
         image: &Arc<RenderImage>,
@@ -135,6 +142,67 @@ mod tests {
         cx.update(|_, cx| {
             assert!(!ImageSource::Image(first.clone()).is_asset_cached(cx));
             assert!(ImageSource::Image(second.clone()).is_asset_cached(cx));
+        });
+    }
+
+    /// An app's own loader, which decodes 16 by 16 pictures of one shade.
+    enum Shades {}
+
+    impl crate::Asset for Shades {
+        type Source = u8;
+        type Output = Result<Arc<crate::RenderImage>, crate::ImageCacheError>;
+
+        fn load(
+            shade: u8,
+            _: &mut crate::App,
+        ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+            async move {
+                let pixels = image::RgbaImage::from_pixel(16, 16, image::Rgba([0, 0, shade, 255]));
+                Ok(Arc::new(crate::RenderImage::new([image::Frame::new(
+                    pixels,
+                )])))
+            }
+        }
+    }
+
+    struct Shaded(u8);
+
+    impl Render for Shaded {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let shade = self.0;
+            img(ImageSource::Custom(Arc::new(move |window, cx| {
+                let image = window.use_asset::<Shades>(&shade, cx);
+                if let Some(Ok(image)) = &image {
+                    cx.decoded_image_drawn::<Shades>(&shade, image);
+                }
+                image
+            })))
+            .size(px(16.))
+        }
+    }
+
+    #[crate::test]
+    fn an_apps_own_picture_counts_against_the_budget(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_decoded_image_budget(1500));
+        let (view, cx) = cx.add_window_view(|_, _| Shaded(1));
+        cx.run_until_parked();
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| cx.has_asset::<Shades>(&1)));
+
+        view.update(cx, |shaded, cx| {
+            shaded.0 = 2;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(
+                !cx.has_asset::<Shades>(&1),
+                "the picture no longer drawn is let go"
+            );
+            assert!(cx.has_asset::<Shades>(&2));
         });
     }
 
