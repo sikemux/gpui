@@ -661,6 +661,10 @@ impl WindowTextSystem {
         self.line_layout_cache.reuse_layouts(index)
     }
 
+    pub(crate) fn reuse_all_layouts(&self) {
+        self.line_layout_cache.reuse_all_layouts()
+    }
+
     pub(crate) fn truncate_layouts(&self, index: LineLayoutIndex) {
         self.line_layout_cache.truncate_layouts(index)
     }

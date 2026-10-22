@@ -133,6 +133,8 @@ struct WindowInvalidatorInner {
     pub dirty: bool,
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
+    /// Views to draw again where they were, leaving the views around them as they were.
+    pub repaint_views: FxHashSet<EntityId>,
     pub update_count: usize,
     #[cfg(feature = "profiler")]
     pub frame_dirty: FrameDirtyAccumulator,
@@ -174,6 +176,7 @@ impl WindowInvalidator {
                 dirty: true,
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
+                repaint_views: FxHashSet::default(),
                 update_count: 0,
                 #[cfg(feature = "profiler")]
                 frame_dirty: FrameDirtyAccumulator::default(),
@@ -233,6 +236,27 @@ impl WindowInvalidator {
         if let Some(waker) = waker {
             waker();
         }
+    }
+
+    /// Asks for `entity`'s view to be drawn again where it was; see [`Context::repaint`].
+    pub fn repaint_view(&self, entity: EntityId) {
+        let mut inner = self.inner.borrow_mut();
+        inner.update_count += 1;
+        inner.repaint_views.insert(entity);
+        let waker = inner.platform_waker.clone();
+        drop(inner);
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    /// Whether a view asked to be drawn again where it was.
+    pub fn wants_repaint(&self) -> bool {
+        !self.inner.borrow().repaint_views.is_empty()
+    }
+
+    pub fn take_repaints(&self) -> FxHashSet<EntityId> {
+        mem::take(&mut self.inner.borrow_mut().repaint_views)
     }
 
     pub fn set_platform_waker(&self, waker: Option<Rc<dyn Fn()>>) {
@@ -1079,6 +1103,185 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    /// What the root prepainted and painted, which a frame that draws only some views again
+    /// copies around them.
+    root_prepaint: Range<PrepaintStateIndex>,
+    root_paint: Range<PaintIndex>,
+    /// Where each view that may be drawn again in place was drawn; see [`Context::repaint`].
+    pub(crate) repaint_sites: FxHashMap<EntityId, RepaintSite>,
+}
+
+/// Where a view that may be drawn again in place was drawn in a frame, and what it was drawn
+/// inside, so it can be drawn there again with nothing around it drawn.
+#[derive(Clone)]
+pub(crate) struct RepaintSite {
+    pub(crate) view: AnyView,
+    pub(crate) prepaint_range: Range<PrepaintStateIndex>,
+    pub(crate) paint_range: Range<PaintIndex>,
+    pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) parent_node: Option<DispatchNodeId>,
+    pub(crate) element_id_stack: ElementIdStack,
+    pub(crate) text_style_stack: Vec<TextStyleRefinement>,
+    pub(crate) rem_size: Pixels,
+    pub(crate) content_mask: ContentMask<Pixels>,
+    pub(crate) opacity: f32,
+    /// Set when the view was drawn more than once in the frame, so it has no one place.
+    pub(crate) drawn_twice: bool,
+}
+
+/// A view a frame draws again in place: where it was, what it renders now, and the element
+/// states its render touched, which belong where it was.
+struct Repaint {
+    entity: EntityId,
+    site: RepaintSite,
+    element: AnyElement,
+    accessed_element_states: Vec<(GlobalElementId, TypeId)>,
+    accessed_entities: FxHashSet<EntityId>,
+}
+
+/// Where a view drawn again in place was in the last frame and is in this one.
+pub(crate) struct Hole<I> {
+    old: Range<I>,
+    new: Range<I>,
+}
+
+/// A position in one of a frame's lists of what it drew, whose counts move together when a
+/// frame keeps the last one around views it drew again. The text layouts are left out: a frame
+/// that draws views again keeps all the last frame's layouts at their indices.
+pub(crate) trait FrameIndex: Clone {
+    const COUNTS: usize;
+    fn count(&self, at: usize) -> usize;
+    fn shift(&mut self, at: usize, by: isize);
+}
+
+impl FrameIndex for PrepaintStateIndex {
+    const COUNTS: usize = 5;
+    fn count(&self, at: usize) -> usize {
+        match at {
+            0 => self.dispatch_tree_index,
+            1 => self.hitboxes_index,
+            2 => self.tooltips_index,
+            3 => self.deferred_draws_index,
+            _ => self.accessed_element_states_index,
+        }
+    }
+    fn shift(&mut self, at: usize, by: isize) {
+        let count = match at {
+            0 => &mut self.dispatch_tree_index,
+            1 => &mut self.hitboxes_index,
+            2 => &mut self.tooltips_index,
+            3 => &mut self.deferred_draws_index,
+            _ => &mut self.accessed_element_states_index,
+        };
+        *count = count.saturating_add_signed(by);
+    }
+}
+
+impl FrameIndex for PaintIndex {
+    #[cfg(any(test, feature = "test-support"))]
+    const COUNTS: usize = 8;
+    #[cfg(not(any(test, feature = "test-support")))]
+    const COUNTS: usize = 7;
+    fn count(&self, at: usize) -> usize {
+        match at {
+            0 => self.scene_index,
+            1 => self.mouse_listeners_index,
+            2 => self.input_handlers_index,
+            3 => self.cursor_styles_index,
+            4 => self.window_control_hitboxes_index,
+            5 => self.accessed_element_states_index,
+            6 => self.tab_handle_index,
+            #[cfg(any(test, feature = "test-support"))]
+            _ => self.debug_bounds_index,
+            #[cfg(not(any(test, feature = "test-support")))]
+            _ => unreachable!(),
+        }
+    }
+    fn shift(&mut self, at: usize, by: isize) {
+        let count = match at {
+            0 => &mut self.scene_index,
+            1 => &mut self.mouse_listeners_index,
+            2 => &mut self.input_handlers_index,
+            3 => &mut self.cursor_styles_index,
+            4 => &mut self.window_control_hitboxes_index,
+            5 => &mut self.accessed_element_states_index,
+            6 => &mut self.tab_handle_index,
+            #[cfg(any(test, feature = "test-support"))]
+            _ => &mut self.debug_bounds_index,
+            #[cfg(not(any(test, feature = "test-support")))]
+            _ => unreachable!(),
+        };
+        *count = count.saturating_add_signed(by);
+    }
+}
+
+/// How far a count at `at` from the last frame moves in a frame with `holes`: by what each
+/// hole it comes after grew.
+fn shift_count<I: FrameIndex>(count: usize, at: usize, holes: &[Hole<I>]) -> usize {
+    let by: isize = holes
+        .iter()
+        .filter(|hole| hole.old.end.count(at) <= count)
+        .map(|hole| grown(hole, at))
+        .sum();
+    count.saturating_add_signed(by)
+}
+
+fn grown<I: FrameIndex>(hole: &Hole<I>, at: usize) -> isize {
+    (hole.new.end.count(at) as isize - hole.new.start.count(at) as isize)
+        - (hole.old.end.count(at) as isize - hole.old.start.count(at) as isize)
+}
+
+/// Why a range from the last frame has no place in a frame that drew some views again.
+pub(crate) enum Lost {
+    /// It was inside a view drawn again, which recorded its own.
+    Inside,
+    /// A view drawn again held nothing to tell where the range was from it.
+    Unknown,
+}
+
+/// Where `range`, from the last frame, is in a frame that kept the last one but drew the views
+/// at `holes` again: one after a hole moves by what the hole grew, and one around a hole
+/// stretches by it, which the answer's flag says.
+pub(crate) fn relocate<I: FrameIndex>(
+    range: &Range<I>,
+    holes: &[Hole<I>],
+) -> Result<(Range<I>, bool), Lost> {
+    let mut start_by = vec![0isize; I::COUNTS];
+    let mut end_by = vec![0isize; I::COUNTS];
+    let mut around = false;
+    for hole in holes {
+        let grew: Vec<isize> = (0..I::COUNTS).map(|at| grown(hole, at)).collect();
+        let Some(at) = (0..I::COUNTS).find(|&at| hole.old.end.count(at) > hole.old.start.count(at))
+        else {
+            if grew.iter().all(|&by| by == 0) {
+                continue;
+            }
+            return Err(Lost::Unknown);
+        };
+        let (start, end) = (range.start.count(at), range.end.count(at));
+        let (hole_start, hole_end) = (hole.old.start.count(at), hole.old.end.count(at));
+        if start >= hole_end {
+            for count in 0..I::COUNTS {
+                start_by[count] += grew[count];
+                end_by[count] += grew[count];
+            }
+        } else if start <= hole_start && end >= hole_end {
+            around = true;
+            for count in 0..I::COUNTS {
+                end_by[count] += grew[count];
+            }
+        } else if start >= hole_start {
+            return Err(Lost::Inside);
+        } else if end > hole_start {
+            return Err(Lost::Unknown);
+        }
+    }
+    let mut moved = range.clone();
+    for count in 0..I::COUNTS {
+        moved.start.shift(count, start_by[count]);
+        moved.end.shift(count, end_by[count]);
+    }
+    Ok((moved, around))
 }
 
 #[derive(Clone, Default)]
@@ -1141,6 +1344,9 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            root_prepaint: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
+            root_paint: PaintIndex::default()..PaintIndex::default(),
+            repaint_sites: FxHashMap::default(),
         }
     }
 
@@ -1159,6 +1365,7 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
+        self.repaint_sites.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -1301,6 +1508,18 @@ pub struct Window {
         SubscriberSet<(), Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// Views that asked to be drawn again in place, so each frame notes where they are drawn.
+    pub(crate) repaint_capable: FxHashSet<EntityId>,
+    /// Counts the frames drawn, so what this frame wrote can be told from what it kept.
+    pub(crate) frame_number: u64,
+    /// Set while a frame draws only some views again and copies the rest of the last one.
+    pub(crate) patching: bool,
+    /// Where this frame drew views again, for moving what it kept of the last one.
+    prepaint_holes: Vec<Hole<PrepaintStateIndex>>,
+    paint_holes: Vec<Hole<PaintIndex>>,
+    /// Set when a frame drawn in part couldn't keep every record of the last one right, so
+    /// the next frame draws everything.
+    redraw_everything: bool,
     /// When the window last presented, by the executor's clock.
     last_present: Instant,
     /// Whether a task is already waiting to free the renderer's idle GPU memory.
@@ -1927,7 +2146,8 @@ impl Window {
                     || (presents_to_hold_refresh_rate
                         && input_rate_tracker.borrow_mut().is_high_rate());
 
-                let should_draw = invalidator.is_dirty() || force_render;
+                let should_draw =
+                    invalidator.is_dirty() || invalidator.wants_repaint() || force_render;
                 if should_draw {
                     measure("frame duration", || {
                         handle
@@ -2229,6 +2449,12 @@ impl Window {
             visibility_observers: SubscriberSet::new(),
             hovered,
             needs_present,
+            repaint_capable: FxHashSet::default(),
+            frame_number: 0,
+            patching: false,
+            prepaint_holes: Vec::new(),
+            paint_holes: Vec::new(),
+            redraw_everything: false,
             last_present: cx.background_executor().now(),
             idle_gpu_release_armed: false,
             input_rate_tracker,
@@ -3510,6 +3736,10 @@ impl Window {
         if self.platform_window.prepare_frame() {
             self.refresh();
         }
+        self.frame_number += 1;
+        if mem::take(&mut self.redraw_everything) {
+            self.refreshing = true;
+        }
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -3533,8 +3763,15 @@ impl Window {
                 self.rendered_frame.input_handlers.push(Some(input_handler));
             }
         }
+        let repaints = self.plan_repaints(cx);
+        let repainted: Option<FxHashSet<EntityId>> = repaints.as_ref().map(|repaints| {
+            repaints
+                .iter()
+                .flat_map(|repaint| repaint.accessed_entities.iter().copied())
+                .collect()
+        });
         if !cx.mode.skip_drawing() {
-            self.draw_roots(cx);
+            self.draw_roots(cx, repaints);
             #[cfg(feature = "profiler")]
             {
                 let viewport_size = self.viewport_size;
@@ -3578,9 +3815,18 @@ impl Window {
                 });
         }
 
+        self.patching = false;
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        match &repainted {
+            Some(accessed) => self.keep_records(accessed),
+            None => {
+                let drawn = &self.next_frame.repaint_sites;
+                self.repaint_capable
+                    .retain(|entity| drawn.contains_key(entity));
+            }
+        }
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -3625,6 +3871,11 @@ impl Window {
         }
 
         debug_assert!(self.rendered_entity_stack.is_empty());
+        if repainted.is_some()
+            && let Some(kept) = cx.tracked_entities.get(&self.handle.window_id()).cloned()
+        {
+            cx.entities.extend_accessed(&kept);
+        }
         self.record_entities_accessed(cx);
         self.reset_cursor_style(cx);
         #[cfg(feature = "profiler")]
@@ -3693,6 +3944,253 @@ impl Window {
             self.mark_view_dirty(entity);
         }
         self.invalidator.replace_views(views);
+    }
+
+    /// The views that asked to be drawn again in place, rendered and measured where they were,
+    /// when this frame can draw only them. Otherwise they are marked dirty, and the frame draws
+    /// as after a notify.
+    fn plan_repaints(&mut self, cx: &mut App) -> Option<Vec<Repaint>> {
+        let asked = self.invalidator.take_repaints();
+        if asked.is_empty() {
+            return None;
+        }
+        self.repaint_capable.extend(asked.iter().copied());
+        #[cfg(any(feature = "inspector", debug_assertions))]
+        let inspecting = self.inspector.is_some();
+        #[cfg(not(any(feature = "inspector", debug_assertions)))]
+        let inspecting = false;
+        self.a11y.sync_active_flag();
+        let whole = self.refreshing
+            || !self.dirty_views.is_empty()
+            || inspecting
+            || self.a11y.is_active()
+            || cx.mode.skip_drawing();
+        let sites: Option<Vec<(EntityId, RepaintSite)>> = asked
+            .iter()
+            .map(|entity| {
+                self.rendered_frame
+                    .repaint_sites
+                    .get(entity)
+                    .filter(|site| !site.drawn_twice)
+                    .map(|site| (*entity, site.clone()))
+            })
+            .collect();
+        let Some(mut sites) = sites.filter(|_| !whole) else {
+            return self.repaint_whole(asked);
+        };
+        sites.sort_by_key(|(_, site)| site.paint_range.start.scene_index);
+        let apart = sites.windows(2).all(|pair| {
+            let (first, second) = (&pair[0].1, &pair[1].1);
+            (0..PrepaintStateIndex::COUNTS).all(|at| {
+                first.prepaint_range.end.count(at) <= second.prepaint_range.start.count(at)
+            }) && (0..PaintIndex::COUNTS)
+                .all(|at| first.paint_range.end.count(at) <= second.paint_range.start.count(at))
+        });
+        if !apart {
+            return self.repaint_whole(asked);
+        }
+
+        self.patching = true;
+        self.text_system.reuse_all_layouts();
+        self.invalidator.set_phase(DrawPhase::Prepaint);
+        let mut repaints = Vec::with_capacity(sites.len());
+        for (entity, site) in sites {
+            let states_start = self.next_frame.accessed_element_states.len();
+            let ((element, room, fitted), accessed_entities) =
+                self.in_site(&site, entity, |window| {
+                    cx.detect_accessed_entities(|cx| {
+                        let mut element =
+                            crate::View::render(site.view.clone(), window, cx).into_any_element();
+                        let room = element.layout_as_root(
+                            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                            window,
+                            cx,
+                        );
+                        let fitted = element.layout_as_root(site.bounds.size.into(), window, cx);
+                        (element, room, fitted)
+                    })
+                });
+            let accessed_element_states = self
+                .next_frame
+                .accessed_element_states
+                .drain(states_start..)
+                .collect();
+            let had = site.bounds.size;
+            let slack = px(0.5);
+            if fitted != had || room.width > had.width + slack || room.height > had.height + slack {
+                self.patching = false;
+                return self.repaint_whole(asked);
+            }
+            repaints.push(Repaint {
+                entity,
+                site,
+                element,
+                accessed_element_states,
+                accessed_entities,
+            });
+        }
+        Some(repaints)
+    }
+
+    fn repaint_whole(&mut self, asked: FxHashSet<EntityId>) -> Option<Vec<Repaint>> {
+        for entity in asked {
+            self.mark_view_dirty(entity);
+        }
+        None
+    }
+
+    /// Runs `f` as inside the view at `site`: with its element ids, text style, rem size,
+    /// content mask and opacity, and with any cached view in it drawn afresh.
+    fn in_site<R>(
+        &mut self,
+        site: &RepaintSite,
+        entity: EntityId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.element_id_stack.clone_from(&site.element_id_stack);
+        self.text_style_stack.clone_from(&site.text_style_stack);
+        let refreshing = mem::replace(&mut self.refreshing, true);
+        let opacity = mem::replace(&mut self.element_opacity, site.opacity);
+        let result = self.with_rendered_view(entity, |window| {
+            window.with_rem_size(Some(site.rem_size), |window| {
+                window.with_content_mask(Some(site.content_mask), f)
+            })
+        });
+        self.element_opacity = opacity;
+        self.refreshing = refreshing;
+        self.element_id_stack.clear();
+        self.text_style_stack.clear();
+        result
+    }
+
+    /// Prepaints the last frame's root again, copying it but for the views being drawn again,
+    /// which prepaint afresh where they were.
+    fn prepaint_repaints(&mut self, repaints: &mut [Repaint], cx: &mut App) {
+        let root = self.rendered_frame.root_prepaint.clone();
+        let mut holes: Vec<Hole<PrepaintStateIndex>> = Vec::new();
+        let mut at = root.start.clone();
+        for repaint in repaints.iter_mut() {
+            let site = repaint.site.clone();
+            self.splice_prepaint(at..site.prepaint_range.start.clone(), &holes);
+            let start = self.prepaint_index();
+            self.next_frame
+                .accessed_element_states
+                .append(&mut repaint.accessed_element_states);
+            let parent = site
+                .parent_node
+                .map(|node| node.moved(|index| shift_count(index, 0, &holes)));
+            self.next_frame.dispatch_tree.open_node(parent);
+            let (entity, origin, element) =
+                (repaint.entity, site.bounds.origin, &mut repaint.element);
+            self.in_site(&site, entity, |window| {
+                window.set_view_id(entity);
+                element.prepaint_at(origin, window, cx);
+            });
+            let end = self.prepaint_index();
+            holes.push(Hole {
+                old: site.prepaint_range.clone(),
+                new: start.clone()..end.clone(),
+            });
+            at = site.prepaint_range.end.clone();
+            self.next_frame.repaint_sites.insert(
+                entity,
+                RepaintSite {
+                    prepaint_range: start..end,
+                    parent_node: parent,
+                    ..site
+                },
+            );
+        }
+        self.splice_prepaint(at..root.end, &holes);
+        self.next_frame.dispatch_tree.close_all();
+        self.prepaint_holes = holes;
+    }
+
+    /// Copies `range` of the last frame's prepaint, which may start and end at any depth, with
+    /// what moved for the `holes` before it.
+    fn splice_prepaint(
+        &mut self,
+        range: Range<PrepaintStateIndex>,
+        holes: &[Hole<PrepaintStateIndex>],
+    ) {
+        let node = |node: DispatchNodeId| node.moved(|index| shift_count(index, 0, holes));
+        let contains_focus = self.next_frame.dispatch_tree.splice(
+            range.start.dispatch_tree_index..range.end.dispatch_tree_index,
+            &mut self.rendered_frame.dispatch_tree,
+            self.focus,
+            node,
+        );
+        if contains_focus {
+            self.next_frame.focus = self.focus;
+        }
+        self.copy_prepaint(&range, node);
+    }
+
+    /// Paints the last frame's root again, copying it but for the views being drawn again.
+    fn paint_repaints(&mut self, repaints: &mut [Repaint], cx: &mut App) {
+        let root = self.rendered_frame.root_paint.clone();
+        let mut holes: Vec<Hole<PaintIndex>> = Vec::new();
+        let mut at = root.start.clone();
+        for repaint in repaints.iter_mut() {
+            let site = repaint.site.clone();
+            self.reuse_paint(at..site.paint_range.start.clone());
+            let start = self.paint_index();
+            let (entity, element) = (repaint.entity, &mut repaint.element);
+            self.in_site(&site, entity, |window| element.paint(window, cx));
+            let end = self.paint_index();
+            holes.push(Hole {
+                old: site.paint_range.clone(),
+                new: start.clone()..end.clone(),
+            });
+            at = site.paint_range.end.clone();
+            if let Some(drawn) = self.next_frame.repaint_sites.get_mut(&entity) {
+                drawn.paint_range = start..end;
+            }
+        }
+        self.reuse_paint(at..root.end);
+        self.paint_holes = holes;
+    }
+
+    /// After a frame that drew only some views again, moves the records it kept of the last
+    /// frame to where it put them, so the next frame reuses them right. When one can't be
+    /// placed, the next frame draws everything.
+    fn keep_records(&mut self, accessed: &FxHashSet<EntityId>) {
+        let prepaint_holes = mem::take(&mut self.prepaint_holes);
+        let paint_holes = mem::take(&mut self.paint_holes);
+        let mut kept = crate::view::relocate_cached_views(
+            &mut self.next_frame.element_states,
+            self.frame_number,
+            &prepaint_holes,
+            &paint_holes,
+            accessed,
+        );
+        for (entity, site) in mem::take(&mut self.rendered_frame.repaint_sites) {
+            if self.next_frame.repaint_sites.contains_key(&entity) {
+                continue;
+            }
+            match (
+                relocate(&site.prepaint_range, &prepaint_holes),
+                relocate(&site.paint_range, &paint_holes),
+            ) {
+                (Ok((prepaint_range, _)), Ok((paint_range, _))) => {
+                    let parent_node = site
+                        .parent_node
+                        .map(|node| node.moved(|index| shift_count(index, 0, &prepaint_holes)));
+                    self.next_frame.repaint_sites.insert(
+                        entity,
+                        RepaintSite {
+                            prepaint_range,
+                            paint_range,
+                            parent_node,
+                            ..site
+                        },
+                    );
+                }
+                (Err(Lost::Inside), _) | (_, Err(Lost::Inside)) => {}
+                _ => kept = false,
+            }
+        }
+        self.redraw_everything |= !kept;
     }
 
     /// Lets native child views sit between the root's drawing and deferred draws.
@@ -3857,7 +4355,7 @@ impl Window {
         self.set_show_repaints(!self.show_repaints());
     }
 
-    fn draw_roots(&mut self, cx: &mut App) {
+    fn draw_roots(&mut self, cx: &mut App, mut repaints: Option<Vec<Repaint>>) {
         #[cfg(feature = "profiler")]
         {
             self.debug_frame_overlay.begin_frame();
@@ -3900,19 +4398,33 @@ impl Window {
         #[cfg(feature = "profiler")]
         let request_layout_start = Instant::now();
         let frame_stats_render = crate::frame_stats::start();
-        let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
-        let root_layout_id = root_element.request_layout(self, cx);
+        let root_prepaint_start = self.prepaint_index();
+        let mut root_element = repaints
+            .is_none()
+            .then(|| self.root.as_ref().unwrap().clone().into_any_element());
+        let root_layout_id = root_element
+            .as_mut()
+            .map(|root_element| root_element.request_layout(self, cx));
         crate::frame_stats::record(crate::frame_stats::Phase::Render, frame_stats_render);
         let frame_stats_prepaint = crate::frame_stats::start();
         #[cfg(feature = "profiler")]
         let prepaint_start = Instant::now();
-        self.layout_engine
-            .as_mut()
-            .unwrap()
-            .stretch_auto_size_to_fill(root_layout_id, root_size, scale_factor);
+        if let Some(root_layout_id) = root_layout_id {
+            self.layout_engine
+                .as_mut()
+                .unwrap()
+                .stretch_auto_size_to_fill(root_layout_id, root_size, scale_factor);
+        }
         #[cfg(feature = "profiler")]
         let laid_out = std::time::Instant::now();
-        root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+        match (&mut root_element, &mut repaints) {
+            (Some(root_element), _) => {
+                root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+            }
+            (None, Some(repaints)) => self.prepaint_repaints(repaints, cx),
+            (None, None) => {}
+        }
+        self.next_frame.root_prepaint = root_prepaint_start..self.prepaint_index();
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
@@ -3967,7 +4479,13 @@ impl Window {
         crate::frame_stats::record(crate::frame_stats::Phase::Prepaint, frame_stats_prepaint);
         let frame_stats_paint = crate::frame_stats::start();
         self.invalidator.set_phase(DrawPhase::Paint);
-        root_element.paint(self, cx);
+        let root_paint_start = self.paint_index();
+        match (&mut root_element, &mut repaints) {
+            (Some(root_element), _) => root_element.paint(self, cx),
+            (None, Some(repaints)) => self.paint_repaints(repaints, cx),
+            (None, None) => {}
+        }
+        self.next_frame.root_paint = root_paint_start..self.paint_index();
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
@@ -4231,6 +4749,34 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        let start = self.prepaint_index();
+        let parent = self.next_frame.dispatch_tree.active_node_id();
+        let reused_subtree = self.next_frame.dispatch_tree.reuse_subtree(
+            range.start.dispatch_tree_index..range.end.dispatch_tree_index,
+            &mut self.rendered_frame.dispatch_tree,
+            self.focus,
+        );
+        if reused_subtree.contains_focus() {
+            self.next_frame.focus = self.focus;
+        }
+        self.copy_prepaint(&range, |node| reused_subtree.refresh_node_id(node));
+        if !self.patching {
+            self.carry_sites_prepaint(&range, &start, |node| match node {
+                Some(node) if reused_subtree.holds(node) => {
+                    Some(reused_subtree.refresh_node_id(node))
+                }
+                _ => parent,
+            });
+        }
+    }
+
+    /// Copies what `range` of the last frame prepainted, but for its dispatch nodes, with each
+    /// deferred draw's parent node moved by `node`.
+    fn copy_prepaint(
+        &mut self,
+        range: &Range<PrepaintStateIndex>,
+        node: impl Fn(DispatchNodeId) -> DispatchNodeId,
+    ) {
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -4248,26 +4794,18 @@ impl Window {
                 .iter()
                 .map(|(id, type_id)| (id.clone(), *type_id)),
         );
-        self.text_system
-            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-
-        let reused_subtree = self.next_frame.dispatch_tree.reuse_subtree(
-            range.start.dispatch_tree_index..range.end.dispatch_tree_index,
-            &mut self.rendered_frame.dispatch_tree,
-            self.focus,
-        );
-
-        if reused_subtree.contains_focus() {
-            self.next_frame.focus = self.focus;
+        if !self.patching {
+            self.text_system.reuse_layouts(
+                range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
+            );
         }
-
         self.next_frame.deferred_draws.extend(
             self.rendered_frame.deferred_draws
                 [range.start.deferred_draws_index..range.end.deferred_draws_index]
                 .iter()
                 .map(|deferred_draw| DeferredDraw {
                     current_view: deferred_draw.current_view,
-                    parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
+                    parent_node: node(deferred_draw.parent_node),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     content_mask: deferred_draw.content_mask,
@@ -4279,6 +4817,90 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
         );
+    }
+
+    /// Keeps where each view that may be drawn again in place is, for those inside `range`
+    /// of the last frame, which was copied whole to start at `start`.
+    fn carry_sites_prepaint(
+        &mut self,
+        range: &Range<PrepaintStateIndex>,
+        start: &PrepaintStateIndex,
+        parent: impl Fn(Option<DispatchNodeId>) -> Option<DispatchNodeId>,
+    ) {
+        if self.rendered_frame.repaint_sites.is_empty() {
+            return;
+        }
+        let inside = |site: &RepaintSite| {
+            (0..PrepaintStateIndex::COUNTS).all(|at| {
+                site.prepaint_range.start.count(at) >= range.start.count(at)
+                    && site.prepaint_range.end.count(at) <= range.end.count(at)
+            })
+        };
+        let carried: Vec<(EntityId, RepaintSite)> = self
+            .rendered_frame
+            .repaint_sites
+            .iter()
+            .filter(|(_, site)| inside(site))
+            .map(|(entity, site)| {
+                let mut site = site.clone();
+                for at in 0..PrepaintStateIndex::COUNTS {
+                    let by = start.count(at) as isize - range.start.count(at) as isize;
+                    site.prepaint_range.start.shift(at, by);
+                    site.prepaint_range.end.shift(at, by);
+                }
+                site.parent_node = parent(site.parent_node);
+                (*entity, site)
+            })
+            .collect();
+        self.next_frame.repaint_sites.extend(carried);
+    }
+
+    /// Notes where a view that may be drawn again in place starts to prepaint.
+    pub(crate) fn begin_repaint_site(&self) -> (PrepaintStateIndex, Option<DispatchNodeId>) {
+        (
+            self.prepaint_index(),
+            self.next_frame.dispatch_tree.active_node_id(),
+        )
+    }
+
+    /// Records where a view that may be drawn again in place prepainted, from `start`.
+    pub(crate) fn end_repaint_site(
+        &mut self,
+        entity: EntityId,
+        view: AnyView,
+        bounds: Bounds<Pixels>,
+        (start, parent_node): (PrepaintStateIndex, Option<DispatchNodeId>),
+    ) {
+        let site = RepaintSite {
+            view,
+            prepaint_range: start..self.prepaint_index(),
+            paint_range: PaintIndex::default()..PaintIndex::default(),
+            bounds,
+            parent_node,
+            element_id_stack: self.element_id_stack.clone(),
+            text_style_stack: self.text_style_stack.clone(),
+            rem_size: self.rem_size(),
+            content_mask: self.content_mask(),
+            opacity: 1.,
+            drawn_twice: false,
+        };
+        match self.next_frame.repaint_sites.entry(entity) {
+            std::collections::hash_map::Entry::Occupied(mut drawn) => {
+                drawn.get_mut().drawn_twice = true
+            }
+            std::collections::hash_map::Entry::Vacant(place) => {
+                place.insert(site);
+            }
+        }
+    }
+
+    /// Records where a view that may be drawn again in place painted.
+    pub(crate) fn paint_repaint_site(&mut self, entity: EntityId, range: Range<PaintIndex>) {
+        let opacity = self.element_opacity;
+        if let Some(site) = self.next_frame.repaint_sites.get_mut(&entity) {
+            site.paint_range = range;
+            site.opacity = opacity;
+        }
     }
 
     pub(crate) fn paint_index(&self) -> PaintIndex {
@@ -4297,6 +4919,7 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        let start = self.paint_index();
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]
         for (selector, bounds) in &self.rendered_frame.debug_bounds_records
@@ -4340,12 +4963,43 @@ impl Window {
                 [range.start.tab_handle_index..range.end.tab_handle_index],
         );
 
-        self.text_system
-            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        if !self.patching {
+            self.text_system.reuse_layouts(
+                range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
+            );
+        }
         self.next_frame.scene.replay(
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
         );
+        if !self.patching {
+            self.carry_sites_paint(&range, &start);
+        }
+    }
+
+    /// Keeps where each view inside `range` of the last frame painted, as `range` was copied
+    /// whole to start at `start`.
+    fn carry_sites_paint(&mut self, range: &Range<PaintIndex>, start: &PaintIndex) {
+        for (entity, site) in &self.rendered_frame.repaint_sites {
+            let inside = (0..PaintIndex::COUNTS).all(|at| {
+                site.paint_range.start.count(at) >= range.start.count(at)
+                    && site.paint_range.end.count(at) <= range.end.count(at)
+            });
+            let Some(carried) = self.next_frame.repaint_sites.get_mut(entity) else {
+                continue;
+            };
+            if !inside {
+                continue;
+            }
+            let mut paint_range = site.paint_range.clone();
+            for at in 0..PaintIndex::COUNTS {
+                let by = start.count(at) as isize - range.start.count(at) as isize;
+                paint_range.start.shift(at, by);
+                paint_range.end.shift(at, by);
+            }
+            carried.paint_range = paint_range;
+            carried.opacity = site.opacity;
+        }
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -10424,5 +11078,193 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+}
+
+#[cfg(test)]
+mod repaint_tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use crate::{
+        AppContext as _, Context, InteractiveElement as _, IntoElement, MouseButton, ParentElement,
+        Render, Styled, TestAppContext, Window, div, px,
+    };
+
+    struct Lamp {
+        lit: bool,
+        width: f32,
+        renders: Rc<Cell<usize>>,
+        clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for Lamp {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let (lit, clicks) = (self.lit, self.clicks.clone());
+            div()
+                .id("lamp")
+                .w(px(self.width))
+                .h(px(20.))
+                .debug_selector(move || if lit { "lit" } else { "dim" }.into())
+                .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                    clicks.set(clicks.get() + 1)
+                })
+        }
+    }
+
+    struct Side {
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Side {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().size_full().debug_selector(|| "side".into())
+        }
+    }
+
+    struct Shelf {
+        lamp: crate::Entity<Lamp>,
+        side: crate::Entity<Side>,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Shelf {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .size_full()
+                .flex()
+                .items_start()
+                .child(self.lamp.clone())
+                .child(
+                    self.side
+                        .clone()
+                        .cached(crate::StyleRefinement::default().w(px(50.)).h(px(20.))),
+                )
+        }
+    }
+
+    struct Counts {
+        shelf: Rc<Cell<usize>>,
+        lamp: Rc<Cell<usize>>,
+        side: Rc<Cell<usize>>,
+        clicks: Rc<Cell<usize>>,
+    }
+
+    fn shelf(
+        cx: &mut TestAppContext,
+    ) -> (
+        crate::Entity<Lamp>,
+        crate::Entity<Shelf>,
+        Counts,
+        &mut crate::VisualTestContext,
+    ) {
+        let counts = Counts {
+            shelf: Rc::default(),
+            lamp: Rc::default(),
+            side: Rc::default(),
+            clicks: Rc::default(),
+        };
+        let (lamp_renders, side_renders, shelf_renders, clicks) = (
+            counts.lamp.clone(),
+            counts.side.clone(),
+            counts.shelf.clone(),
+            counts.clicks.clone(),
+        );
+        let (shelf, cx) = cx.add_window_view(|_, cx| Shelf {
+            lamp: cx.new(|_| Lamp {
+                lit: false,
+                width: 40.,
+                renders: lamp_renders,
+                clicks,
+            }),
+            side: cx.new(|_| Side {
+                renders: side_renders,
+            }),
+            renders: shelf_renders,
+        });
+        cx.run_until_parked();
+        let lamp = shelf.read_with(cx, |shelf, _| shelf.lamp.clone());
+        (lamp, shelf, counts, cx)
+    }
+
+    #[gpui::test]
+    fn test_repaint_draws_only_the_view_in_place(cx: &mut TestAppContext) {
+        let (lamp, shelf, counts, cx) = shelf(cx);
+
+        lamp.update(cx, |lamp, cx| {
+            lamp.lit = true;
+            cx.repaint();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("lit").is_some(), "the first repaint draws");
+
+        let around = (counts.shelf.get(), counts.side.get());
+        let lamp_renders = counts.lamp.get();
+        lamp.update(cx, |lamp, cx| {
+            lamp.lit = false;
+            cx.repaint();
+        });
+        cx.run_until_parked();
+        assert_eq!(counts.lamp.get(), lamp_renders + 1, "the lamp drew again");
+        assert_eq!(
+            (counts.shelf.get(), counts.side.get()),
+            around,
+            "nothing around the lamp drew again"
+        );
+        assert!(cx.debug_bounds("dim").is_some() && cx.debug_bounds("lit").is_none());
+        assert!(
+            cx.debug_bounds("side").is_some(),
+            "the view beside it is kept"
+        );
+
+        let at = cx.debug_bounds("dim").unwrap().center();
+        cx.simulate_click(at, crate::Modifiers::default());
+        assert_eq!(counts.clicks.get(), 1, "the lamp still hears the mouse");
+
+        let side_renders = counts.side.get();
+        shelf.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(
+            counts.side.get(),
+            side_renders,
+            "a whole frame after it reuses the cached view the partial frame kept"
+        );
+        assert!(cx.debug_bounds("side").is_some() && cx.debug_bounds("dim").is_some());
+
+        let around = (counts.shelf.get(), counts.side.get());
+        lamp.update(cx, |lamp, cx| {
+            lamp.lit = true;
+            cx.repaint();
+        });
+        cx.run_until_parked();
+        assert_eq!((counts.shelf.get(), counts.side.get()), around);
+        assert!(cx.debug_bounds("lit").is_some() && cx.debug_bounds("side").is_some());
+        let at = cx.debug_bounds("lit").unwrap().center();
+        cx.simulate_click(at, crate::Modifiers::default());
+        assert_eq!(counts.clicks.get(), 2);
+    }
+
+    #[gpui::test]
+    fn test_repaint_that_changes_the_size_draws_as_after_notify(cx: &mut TestAppContext) {
+        let (lamp, _shelf, counts, cx) = shelf(cx);
+        lamp.update(cx, |_, cx| cx.repaint());
+        cx.run_until_parked();
+
+        let shelf_renders = counts.shelf.get();
+        lamp.update(cx, |lamp, cx| {
+            lamp.width = 80.;
+            lamp.lit = true;
+            cx.repaint();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            counts.shelf.get(),
+            shelf_renders + 1,
+            "the shelf laid out again"
+        );
+        assert_eq!(cx.debug_bounds("lit").unwrap().size.width, px(80.));
+        assert!(cx.debug_bounds("side").is_some());
     }
 }

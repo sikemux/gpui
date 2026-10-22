@@ -2167,7 +2167,8 @@ impl App {
                         .values()
                         .filter_map(|window| {
                             let window = window.as_deref()?;
-                            window.invalidator.is_dirty().then_some(window.handle)
+                            (window.invalidator.is_dirty() || window.invalidator.wants_repaint())
+                                .then_some(window.handle)
                         })
                         .collect::<Vec<_>>()
                     {
@@ -2179,6 +2180,7 @@ impl App {
                 if self.pending_effects.is_empty() {
                     for window in self.windows.values().filter_map(|window| window.as_deref()) {
                         if window.invalidator.is_dirty()
+                            || window.invalidator.wants_repaint()
                             || window.needs_present.get()
                             || !window.next_frame_callbacks.borrow().is_empty()
                         {
@@ -3224,6 +3226,29 @@ impl App {
 
         self.window_invalidators_by_entity
             .insert(entity_id, window_invalidators);
+    }
+
+    /// Draws an entity's view again where it was last drawn, leaving the views around it as they
+    /// were; see [`Context::repaint`].
+    pub fn repaint(&mut self, entity_id: EntityId) {
+        let live: SmallVec<[WindowInvalidator; 2]> = self
+            .window_invalidators_by_entity
+            .get(&entity_id)
+            .into_iter()
+            .flatten()
+            .filter(|(window_id, _)| {
+                self.tracked_entities
+                    .get(*window_id)
+                    .is_some_and(|set| set.contains(&entity_id))
+            })
+            .map(|(_, invalidator)| invalidator.clone())
+            .collect();
+        if live.is_empty() {
+            return self.notify(entity_id);
+        }
+        for invalidator in &live {
+            invalidator.repaint_view(entity_id);
+        }
     }
 
     /// Returns the name for this [`App`].

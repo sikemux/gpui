@@ -1,3 +1,4 @@
+use crate::window::{ElementStateBox, Hole, Lost, relocate};
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
     Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
@@ -6,7 +7,7 @@ use crate::{
 };
 use crate::{Empty, Window};
 use anyhow::Result;
-use collections::FxHashSet;
+use collections::{FxHashMap, FxHashSet};
 use refineable::Refineable;
 use std::mem;
 use std::{
@@ -94,6 +95,10 @@ impl Eq for AnyView {}
 impl View for AnyView {
     fn entity_id(&self) -> Option<EntityId> {
         Some(self.entity.entity_id())
+    }
+
+    fn redraw_handle(&self) -> Option<AnyView> {
+        Some(self.clone())
     }
 
     #[cfg(not(gpui_hot_reload))]
@@ -218,6 +223,12 @@ pub trait View: 'static + Sized {
 
     /// Render this view into an element tree, consuming `self`.
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement;
+
+    /// A handle that renders this view again on its own, which lets [`Context::repaint`] draw
+    /// it in place. A view that isn't an entity's own render has none.
+    fn redraw_handle(&self) -> Option<AnyView> {
+        None
+    }
 }
 
 /// A stateless component (`RenderOnce`) is a `View` with no identity.
@@ -244,6 +255,10 @@ impl<T: Render> View for Entity<T> {
             Render::render(this, window, cx).into_any_element()
         })
     }
+
+    fn redraw_handle(&self) -> Option<AnyView> {
+        Some(self.clone().into())
+    }
 }
 
 impl<T: Render> Entity<T> {
@@ -266,6 +281,8 @@ impl<T: Render> Entity<T> {
 pub struct ViewElement<V: View> {
     view: Option<V>,
     entity_id: Option<EntityId>,
+    /// Renders the view again on its own, kept while the window notes where it draws.
+    handle: Option<AnyView>,
     cached_style: Option<StyleRefinement>,
     #[cfg(feature = "profiler")]
     view_type_name: &'static str,
@@ -288,6 +305,7 @@ impl<V: View> ViewElement<V> {
         let entity_id = view.entity_id();
         ViewElement {
             entity_id,
+            handle: None,
             cached_style: None,
             #[cfg(feature = "profiler")]
             view_type_name,
@@ -325,6 +343,48 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// The frame that last wrote the ranges.
+    drawn_in: u64,
+}
+
+/// After a frame that drew only some views again, moves the ranges of the cached views it
+/// kept to where it put them, and has those around a view drawn again read what that view
+/// read. Answers false when one couldn't be placed.
+pub(crate) fn relocate_cached_views(
+    states: &mut FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
+    frame_number: u64,
+    prepaint_holes: &[Hole<PrepaintStateIndex>],
+    paint_holes: &[Hole<PaintIndex>],
+    accessed: &FxHashSet<EntityId>,
+) -> bool {
+    let mut kept = true;
+    for ((_, type_id), state) in states.iter_mut() {
+        if *type_id != TypeId::of::<ViewElementState>() {
+            continue;
+        }
+        let Some(Some(state)) = state.inner.downcast_mut::<Option<ViewElementState>>() else {
+            continue;
+        };
+        if state.drawn_in == frame_number {
+            continue;
+        }
+        match (
+            relocate(&state.prepaint_range, prepaint_holes),
+            relocate(&state.paint_range, paint_holes),
+        ) {
+            (Ok((prepaint_range, around)), Ok((paint_range, _))) => {
+                state.prepaint_range = prepaint_range;
+                state.paint_range = paint_range;
+                state.drawn_in = frame_number;
+                if around {
+                    state.accessed_entities.extend(accessed.iter().copied());
+                }
+            }
+            (Err(Lost::Inside), _) | (_, Err(Lost::Inside)) => {}
+            _ => kept = false,
+        }
+    }
+    kept
 }
 
 struct ViewElementCacheKey {
@@ -378,6 +438,9 @@ impl<V: View> Element for ViewElement<V> {
             // Stateful path: create a reactive boundary.
             #[cfg(feature = "profiler")]
             let start = window.window_profiler.begin_view();
+            if window.repaint_capable.contains(&entity_id) {
+                self.handle = self.view.as_ref().and_then(View::redraw_handle);
+            }
             let view = &mut self.view;
             let layout = request_layout_view(
                 entity_id,
@@ -416,6 +479,7 @@ impl<V: View> Element for ViewElement<V> {
             let start = window.window_profiler.begin_view();
             let prepainted = prepaint_view(
                 entity_id,
+                self.handle.take(),
                 global_id,
                 bounds,
                 element,
@@ -523,6 +587,7 @@ fn request_layout_component(
 #[inline(never)]
 fn prepaint_view(
     entity_id: EntityId,
+    handle: Option<AnyView>,
     global_id: Option<&GlobalElementId>,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
@@ -531,6 +596,26 @@ fn prepaint_view(
     render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
 ) -> Option<AnyElement> {
     window.set_view_id(entity_id);
+    let site = handle.map(|handle| (handle, window.begin_repaint_site()));
+    let carried = window.next_frame.repaint_sites.contains_key(&entity_id);
+    let prepainted = prepaint_view_in(entity_id, global_id, bounds, element, window, cx, render);
+    if let Some((handle, start)) = site
+        && (carried || !window.next_frame.repaint_sites.contains_key(&entity_id))
+    {
+        window.end_repaint_site(entity_id, handle, bounds, start);
+    }
+    prepainted
+}
+
+fn prepaint_view_in(
+    entity_id: EntityId,
+    global_id: Option<&GlobalElementId>,
+    bounds: Bounds<Pixels>,
+    element: &mut Option<AnyElement>,
+    window: &mut Window,
+    cx: &mut App,
+    render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
+) -> Option<AnyElement> {
     window.with_rendered_view(entity_id, |window| {
         if let Some(mut element) = element.take() {
             window.note_notified(entity_id, bounds);
@@ -558,6 +643,7 @@ fn prepaint_view(
                         .extend_accessed(&element_state.accessed_entities);
                     let prepaint_end = window.prepaint_index();
                     element_state.prepaint_range = prepaint_start..prepaint_end;
+                    element_state.drawn_in = window.frame_number;
 
                     return (None, element_state);
                 }
@@ -581,6 +667,7 @@ fn prepaint_view(
                     Some(element),
                     ViewElementState {
                         accessed_entities,
+                        drawn_in: window.frame_number,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         cache_key: ViewElementCacheKey {
@@ -617,6 +704,23 @@ fn paint_view(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let noted = window.repaint_capable.contains(&entity_id);
+    let start = noted.then(|| window.paint_index());
+    paint_view_in(entity_id, cached, global_id, element, window, cx);
+    if let Some(start) = start {
+        let end = window.paint_index();
+        window.paint_repaint_site(entity_id, start..end);
+    }
+}
+
+fn paint_view_in(
+    entity_id: EntityId,
+    cached: bool,
+    global_id: Option<&GlobalElementId>,
+    element: &mut Option<AnyElement>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     window.with_rendered_view(entity_id, |window| {
         let caching_disabled = window.is_inspector_picking(cx);
         if cached && !caching_disabled {
@@ -637,6 +741,7 @@ fn paint_view(
 
                     let paint_end = window.paint_index();
                     element_state.paint_range = paint_start..paint_end;
+                    element_state.drawn_in = window.frame_number;
 
                     ((), element_state)
                 },
