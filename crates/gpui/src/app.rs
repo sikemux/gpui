@@ -908,6 +908,7 @@ pub struct App {
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
+    pub(crate) decoded_images: crate::decoded_images::DecodedImages,
     asset_source: Arc<dyn AssetSource>,
     pub(crate) svg_renderer: SvgRenderer,
     http_client: Arc<dyn HttpClient>,
@@ -996,6 +997,7 @@ impl App {
                 hang_monitor: None,
                 svg_renderer: SvgRenderer::new(asset_source.clone()),
                 loading_assets: Default::default(),
+                decoded_images: Default::default(),
                 asset_source,
                 http_client,
                 globals_by_type: Default::default(),
