@@ -283,7 +283,6 @@ pub struct ViewElement<V: View> {
     entity_id: Option<EntityId>,
     /// Renders the view again on its own, kept while the window notes where it draws.
     handle: Option<AnyView>,
-    isolated: bool,
     cached_style: Option<StyleRefinement>,
     #[cfg(feature = "profiler")]
     view_type_name: &'static str,
@@ -307,7 +306,6 @@ impl<V: View> ViewElement<V> {
         ViewElement {
             entity_id,
             handle: None,
-            isolated: false,
             cached_style: None,
             #[cfg(feature = "profiler")]
             view_type_name,
@@ -328,17 +326,6 @@ impl<V: View> ViewElement<V> {
     /// entity-backed by construction.
     pub(crate) fn cached(mut self, style: StyleRefinement) -> Self {
         self.cached_style = Some(style);
-        self
-    }
-
-    /// Keeps a change inside this view from drawing the views around it again: a notify of
-    /// this view, or of any view drawn inside it, draws this one again in place, as
-    /// [`Context::repaint`] does, rather than dirtying its ancestors. A view whose input field
-    /// notifies on every key, such as a message composer, then costs only its own render to
-    /// type in. When it comes out a different size, or the window has other changes to draw,
-    /// the window draws as after a notify.
-    pub fn isolated(mut self) -> Self {
-        self.isolated = true;
         self
     }
 }
@@ -452,9 +439,6 @@ impl<V: View> Element for ViewElement<V> {
             // Stateful path: create a reactive boundary.
             #[cfg(feature = "profiler")]
             let start = window.window_profiler.begin_view();
-            if self.isolated {
-                window.isolate(entity_id);
-            }
             if window.repaint_capable.contains(&entity_id) {
                 self.handle = self.view.as_ref().and_then(View::redraw_handle);
             }
