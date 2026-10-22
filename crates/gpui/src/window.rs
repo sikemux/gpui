@@ -1154,6 +1154,14 @@ pub(crate) trait FrameIndex: Clone {
     fn shift(&mut self, at: usize, by: isize);
 }
 
+impl PrepaintStateIndex {
+    const ACCESSED_ELEMENT_STATES: usize = 4;
+}
+
+impl PaintIndex {
+    const ACCESSED_ELEMENT_STATES: usize = 5;
+}
+
 impl FrameIndex for PrepaintStateIndex {
     const COUNTS: usize = 5;
     fn count(&self, at: usize) -> usize {
@@ -1215,6 +1223,18 @@ impl FrameIndex for PaintIndex {
     }
 }
 
+/// How much the views drawn again at `holes` grew the element states they read while
+/// prepainting. Paint reads into the same list after all prepaint, so every paint count of it
+/// moves by this.
+pub(crate) fn paint_base(prepaint_holes: &[Hole<PrepaintStateIndex>]) -> Vec<isize> {
+    let mut base = vec![0; PaintIndex::COUNTS];
+    base[PaintIndex::ACCESSED_ELEMENT_STATES] = prepaint_holes
+        .iter()
+        .map(|hole| grown(hole, PrepaintStateIndex::ACCESSED_ELEMENT_STATES))
+        .sum();
+    base
+}
+
 /// How far a count at `at` from the last frame moves in a frame with `holes`: by what each
 /// hole it comes after grew.
 fn shift_count<I: FrameIndex>(count: usize, at: usize, holes: &[Hole<I>]) -> usize {
@@ -1241,13 +1261,18 @@ pub(crate) enum Lost {
 
 /// Where `range`, from the last frame, is in a frame that kept the last one but drew the views
 /// at `holes` again: one after a hole moves by what the hole grew, and one around a hole
-/// stretches by it, which the answer's flag says.
+/// stretches by it, which the answer's flag says. Every count also moves by `base`, for a list
+/// an earlier phase of the frame wrote into first.
 pub(crate) fn relocate<I: FrameIndex>(
     range: &Range<I>,
     holes: &[Hole<I>],
+    base: &[isize],
 ) -> Result<(Range<I>, bool), Lost> {
     let mut start_by = vec![0isize; I::COUNTS];
-    let mut end_by = vec![0isize; I::COUNTS];
+    for (count, by) in start_by.iter_mut().zip(base) {
+        *count += by;
+    }
+    let mut end_by = start_by.clone();
     let mut around = false;
     for hole in holes {
         let grew: Vec<isize> = (0..I::COUNTS).map(|at| grown(hole, at)).collect();
@@ -4173,6 +4198,7 @@ impl Window {
     fn keep_records(&mut self, accessed: &FxHashSet<EntityId>) {
         let prepaint_holes = mem::take(&mut self.prepaint_holes);
         let paint_holes = mem::take(&mut self.paint_holes);
+        let base = paint_base(&prepaint_holes);
         let mut kept = crate::view::relocate_cached_views(
             &mut self.next_frame.element_states,
             self.frame_number,
@@ -4185,8 +4211,8 @@ impl Window {
                 continue;
             }
             match (
-                relocate(&site.prepaint_range, &prepaint_holes),
-                relocate(&site.paint_range, &paint_holes),
+                relocate(&site.prepaint_range, &prepaint_holes, &[]),
+                relocate(&site.paint_range, &paint_holes, &base),
             ) {
                 (Ok((prepaint_range, _)), Ok((paint_range, _))) => {
                     let parent_node = site
@@ -4835,6 +4861,41 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
         );
+    }
+
+    /// Whether ranges a cached view recorded lie within what the last frame drew, as they must
+    /// to be reused. One that doesn't is drawn afresh rather than read out of bounds.
+    pub(crate) fn fits_last_frame(
+        &self,
+        prepaint: &Range<PrepaintStateIndex>,
+        paint: &Range<PaintIndex>,
+    ) -> bool {
+        let frame = &self.rendered_frame;
+        let prepaint_lens = [
+            frame.dispatch_tree.len(),
+            frame.hitboxes.len(),
+            frame.tooltip_requests.len(),
+            frame.deferred_draws.len(),
+            frame.accessed_element_states.len(),
+        ];
+        let paint_lens = [
+            frame.scene.len(),
+            frame.mouse_listeners.len(),
+            frame.input_handlers.len(),
+            frame.cursor_styles.len(),
+            frame.window_control_hitboxes.len(),
+            frame.accessed_element_states.len(),
+            frame.tab_stops.insertion_history.len(),
+            #[cfg(any(test, feature = "test-support"))]
+            frame.debug_bounds_records.len(),
+        ];
+        let fits = prepaint_lens.iter().enumerate().all(|(at, &len)| {
+            prepaint.start.count(at) <= prepaint.end.count(at) && prepaint.end.count(at) <= len
+        }) && paint_lens.iter().enumerate().all(|(at, &len)| {
+            paint.start.count(at) <= paint.end.count(at) && paint.end.count(at) <= len
+        });
+        debug_assert!(fits, "a cached view's ranges run past the last frame");
+        fits
     }
 
     /// Keeps where each view that may be drawn again in place is, for those inside `range`
@@ -11190,7 +11251,8 @@ mod repaint_tests {
 
     use crate::{
         AppContext as _, Context, InteractiveElement as _, IntoElement, MouseButton, ParentElement,
-        Render, Styled, TestAppContext, Window, div, px,
+        Render, StatefulInteractiveElement as _, Styled, TestAppContext, Window, div,
+        prelude::FluentBuilder as _, px,
     };
 
     struct Lamp {
@@ -11368,6 +11430,74 @@ mod repaint_tests {
             "the shelf laid out again"
         );
         assert_eq!(cx.debug_bounds("lit").unwrap().size.width, px(80.));
+        assert!(cx.debug_bounds("side").is_some());
+    }
+
+    struct Blink {
+        on: bool,
+    }
+
+    impl Render for Blink {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let on = self.on;
+            div().id("blink").size_full().when(on, |blink| {
+                blink.child(div().id("caret").size_full().on_click(|_, _, _| {}))
+            })
+        }
+    }
+
+    struct Pane {
+        blink: crate::Entity<Blink>,
+        side: crate::Entity<Side>,
+    }
+
+    impl Render for Pane {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .child(
+                    self.blink
+                        .clone()
+                        .cached(crate::StyleRefinement::default().w(px(40.)).h(px(20.))),
+                )
+                .child(
+                    self.side
+                        .clone()
+                        .cached(crate::StyleRefinement::default().w(px(50.)).h(px(20.))),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn test_whole_frame_after_repaints_that_change_element_states(cx: &mut TestAppContext) {
+        let side_renders = Rc::new(Cell::new(0));
+        let renders = side_renders.clone();
+        let (pane, cx) = cx.add_window_view(|_, cx| Pane {
+            blink: cx.new(|_| Blink { on: false }),
+            side: cx.new(|_| Side { renders }),
+        });
+        cx.run_until_parked();
+        let blink = pane.read_with(cx, |pane, _| pane.blink.clone());
+        for _ in 0..20 {
+            blink.update(cx, |blink, cx| {
+                blink.on = !blink.on;
+                cx.repaint();
+            });
+            cx.run_until_parked();
+        }
+        let kept = side_renders.get();
+        pane.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(side_renders.get(), kept, "the cached neighbour is reused");
+        assert!(cx.debug_bounds("side").is_some());
+        blink.update(cx, |blink, cx| {
+            blink.on = !blink.on;
+            cx.repaint();
+        });
+        cx.run_until_parked();
+        pane.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
         assert!(cx.debug_bounds("side").is_some());
     }
 }

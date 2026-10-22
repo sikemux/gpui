@@ -1,4 +1,4 @@
-use crate::window::{ElementStateBox, Hole, Lost, relocate};
+use crate::window::{ElementStateBox, Hole, Lost, paint_base, relocate};
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
     Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
@@ -357,6 +357,7 @@ pub(crate) fn relocate_cached_views(
     paint_holes: &[Hole<PaintIndex>],
     accessed: &FxHashSet<EntityId>,
 ) -> bool {
+    let base = paint_base(prepaint_holes);
     let mut kept = true;
     for ((_, type_id), state) in states.iter_mut() {
         if *type_id != TypeId::of::<ViewElementState>() {
@@ -369,8 +370,8 @@ pub(crate) fn relocate_cached_views(
             continue;
         }
         match (
-            relocate(&state.prepaint_range, prepaint_holes),
-            relocate(&state.paint_range, paint_holes),
+            relocate(&state.prepaint_range, prepaint_holes, &[]),
+            relocate(&state.paint_range, paint_holes, &base),
         ) {
             (Ok((prepaint_range, around)), Ok((paint_range, _))) => {
                 state.prepaint_range = prepaint_range;
@@ -634,6 +635,8 @@ fn prepaint_view_in(
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
                     && !window.dirty_views.contains(&entity_id)
+                    && window
+                        .fits_last_frame(&element_state.prepaint_range, &element_state.paint_range)
                     && !window.refreshing
                 {
                     let prepaint_start = window.prepaint_index();
