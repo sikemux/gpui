@@ -6875,7 +6875,9 @@ impl Window {
         let old_modality = self.last_input_modality;
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
-            PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            PlatformInput::MouseMove(_)
+            | PlatformInput::MouseDown(_)
+            | PlatformInput::FileDrop(_) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
@@ -10433,6 +10435,58 @@ mod tests {
             cx.test_window(failed.window).external_drag_files(),
             [(failed_path, true)]
         );
+    }
+
+    #[gpui::test]
+    fn file_dropped_after_a_key_press_reaches_the_drop_target(cx: &mut TestAppContext) {
+        struct DropTarget(Rc<RefCell<Vec<PathBuf>>>);
+
+        impl Render for DropTarget {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let dropped = self.0.clone();
+                div()
+                    .size_full()
+                    .on_drop(move |paths: &ExternalPaths, _, _| {
+                        dropped.borrow_mut().extend(paths.paths().iter().cloned());
+                    })
+            }
+        }
+
+        let dropped = Rc::new(RefCell::new(Vec::new()));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let dropped = dropped.clone();
+                move |_, _| DropTarget(dropped)
+            })
+            .into();
+        let path = PathBuf::from("/tmp/dropped-after-typing");
+        let position = point(px(30.), px(30.));
+        let update_result = cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: Keystroke::parse("a").expect("valid keystroke"),
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position,
+                    paths: ExternalPaths([path.clone()].into_iter().collect()),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+            window.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
+        });
+        assert!(
+            update_result.is_ok(),
+            "failed to drop the file: {update_result:?}"
+        );
+        assert_eq!(dropped.borrow().as_slice(), std::slice::from_ref(&path));
     }
 
     struct FocusForwarder {
