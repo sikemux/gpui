@@ -889,14 +889,13 @@ impl WindowTextSystem {
                     LetterSpacing(*width / font_size)
                 });
 
-                let decoration_changed = if let Some(last_run) = decoration_runs.last_mut()
+                if let Some(last_run) = decoration_runs.last_mut()
                     && last_run.color == run.color
                     && last_run.underline == run.underline
                     && last_run.strikethrough == run.strikethrough
                     && last_run.background_color == run.background_color
                 {
                     last_run.len += run_len_within_line as u32;
-                    false
                 } else {
                     decoration_runs.push(DecorationRun {
                         len: run_len_within_line as u32,
@@ -905,15 +904,16 @@ impl WindowTextSystem {
                         underline: run.underline,
                         strikethrough: run.strikethrough,
                     });
-                    true
-                };
+                }
 
+                // Colour is painted over the glyphs' byte ranges, so text in one font shapes as one
+                // run however many colours it has; a ligature across a colour change takes the
+                // first colour.
                 let font_id = self.resolve_font(&run.font);
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
                     && run.font.letter_spacing == font_run.letter_spacing
                     && run.font.scale == font_run.scale
-                    && !decoration_changed
                     && leading.0 == 0.
                 {
                     font_run.len += run_len_within_line;
