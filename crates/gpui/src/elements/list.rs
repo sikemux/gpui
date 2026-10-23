@@ -844,6 +844,19 @@ impl ListState {
 }
 
 impl StateInner {
+    /// Whether scrolling a bottom-aligned list to `top` of at most `max` reaches its end. Items
+    /// not yet measured count as no height, so the bottom of those measured is the end only when
+    /// none below it wait to be measured; items just added under a reader at the bottom would
+    /// otherwise put the reader past them.
+    fn reaches_end(&self, top: Pixels, max: Pixels) -> bool {
+        if self.alignment != ListAlignment::Bottom || top != max {
+            return false;
+        }
+        let mut cursor = self.items.cursor::<ListItemSummary>(());
+        cursor.seek(&Height(top), Bias::Right);
+        !cursor.suffix().summary().has_unknown_height
+    }
+
     fn max_scroll_offset(&self) -> Pixels {
         let bounds = self.last_layout_bounds.unwrap_or_default();
         let height = self
@@ -886,7 +899,7 @@ impl StateInner {
             .max(px(0.))
             .min(scroll_max);
 
-        if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
+        if self.reaches_end(new_scroll_top, scroll_max) {
             self.set_scroll_anchor(None);
         } else {
             let (start, ..) =
@@ -1418,7 +1431,7 @@ impl StateInner {
 
         self.follow_state.stop_following();
 
-        if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
+        if self.reaches_end(new_scroll_top, scroll_max) {
             self.set_scroll_anchor(None);
         } else {
             let (start, _, _) =
