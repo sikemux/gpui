@@ -358,6 +358,9 @@ struct ViewElementState {
     accessed_entities: FxHashSet<EntityId>,
     /// The frame that last wrote the ranges.
     drawn_in: u64,
+    /// The frame whose paint wrote `paint_range`. A view prepainted but not painted, such as one
+    /// under a hidden parent, keeps an older paint range that no longer matches its prepaint.
+    painted_in: u64,
 }
 
 /// After a frame that drew only some views again, moves the ranges of the cached views it
@@ -390,6 +393,7 @@ pub(crate) fn relocate_cached_views(
                 state.prepaint_range = prepaint_range;
                 state.paint_range = paint_range;
                 state.drawn_in = frame_number;
+                state.painted_in = frame_number;
                 if around {
                     state.accessed_entities.extend(accessed.iter().copied());
                 }
@@ -651,6 +655,8 @@ fn prepaint_view_in(
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
                     && !window.dirty_views.contains(&entity_id)
+                    && element_state.drawn_in + 1 == window.frame_number
+                    && element_state.painted_in == element_state.drawn_in
                     && window
                         .fits_last_frame(&element_state.prepaint_range, &element_state.paint_range)
                     && !window.refreshing
@@ -687,6 +693,7 @@ fn prepaint_view_in(
                     ViewElementState {
                         accessed_entities,
                         drawn_in: window.frame_number,
+                        painted_in: 0,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         cache_key: ViewElementCacheKey {
@@ -761,6 +768,7 @@ fn paint_view_in(
                     let paint_end = window.paint_index();
                     element_state.paint_range = paint_start..paint_end;
                     element_state.drawn_in = window.frame_number;
+                    element_state.painted_in = window.frame_number;
 
                     ((), element_state)
                 },
