@@ -617,6 +617,18 @@ impl DirectWriteState {
                 break_ligatures = !break_ligatures;
             }
 
+            // DirectWrite reads every line left to right unless told otherwise, which would put
+            // the Latin words of an Arabic or Hebrew line on the wrong side. Such a line is laid
+            // out right to left in a box exactly its width, so its runs still sit from zero. The
+            // width is measured first, since an endless right-to-left box has none.
+            if unicode_bidi::get_base_direction(text) == unicode_bidi::Direction::Rtl {
+                let mut metrics = DWRITE_TEXT_METRICS::default();
+                text_layout.GetMetrics(&mut metrics)?;
+                text_layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                text_layout.SetMaxWidth(metrics.widthIncludingTrailingWhitespace)?;
+                text_layout.SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT)?;
+            }
+
             let mut runs = Vec::new();
             let mut renderer_context = RendererContext {
                 text_system: self,
