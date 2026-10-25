@@ -93,6 +93,27 @@ impl Scene {
         self.paint_operations.len()
     }
 
+    /// Where the paint operations in `range` draw: each primitive's bounds cut to its content
+    /// mask. Shadows are left out, as they fade into whatever is beneath them.
+    pub fn drawn_bounds(
+        &self,
+        range: Range<usize>,
+    ) -> impl Iterator<Item = Bounds<ScaledPixels>> + '_ {
+        self.paint_operations[range]
+            .iter()
+            .filter_map(|operation| match operation {
+                PaintOperation::Primitive(primitive)
+                    if !matches!(primitive, Primitive::Shadow(_)) =>
+                {
+                    let drawn = primitive
+                        .bounds()
+                        .intersect(&primitive.content_mask().bounds);
+                    (!drawn.is_empty()).then_some(drawn)
+                }
+                _ => None,
+            })
+    }
+
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
