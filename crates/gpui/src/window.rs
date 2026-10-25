@@ -1262,6 +1262,14 @@ pub(crate) enum Lost {
     Unknown,
 }
 
+/// Whether `range` lies inside `outer`. A view drawn outside the root, such as in a deferred
+/// draw, can't be drawn again in place, since a partial frame copies only the root around it.
+fn within<I: FrameIndex>(range: &Range<I>, outer: &Range<I>) -> bool {
+    (0..I::COUNTS).all(|at| {
+        outer.start.count(at) <= range.start.count(at) && range.end.count(at) <= outer.end.count(at)
+    })
+}
+
 /// Where `range`, from the last frame, is in a frame that kept the last one but drew the views
 /// at `holes` again: one after a hole moves by what the hole grew, and one around a hole
 /// stretches by it, which the answer's flag says. Every count also moves by `base`, for a list
@@ -4049,7 +4057,11 @@ impl Window {
                 self.rendered_frame
                     .repaint_sites
                     .get(entity)
-                    .filter(|site| !site.drawn_twice)
+                    .filter(|site| {
+                        !site.drawn_twice
+                            && within(&site.prepaint_range, &self.rendered_frame.root_prepaint)
+                            && within(&site.paint_range, &self.rendered_frame.root_paint)
+                    })
                     .map(|site| (*entity, site.clone()))
             })
             .collect();
@@ -11914,5 +11926,42 @@ mod repaint_tests {
         assert_eq!(counts.form.get(), form_renders + 1);
         assert!(cx.debug_bounds("caret-on").is_some());
         assert!(cx.debug_bounds("field").is_some());
+    }
+
+    struct Popover {
+        lamp: crate::Entity<Lamp>,
+    }
+
+    impl Render for Popover {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(div().w(px(30.)).h(px(20.)))
+                .child(crate::deferred(self.lamp.clone()))
+        }
+    }
+
+    #[gpui::test]
+    fn test_repaint_of_a_view_in_a_deferred_draw(cx: &mut TestAppContext) {
+        let renders = Rc::new(Cell::new(0));
+        let (popover, cx) = cx.add_window_view(|_, cx| Popover {
+            lamp: cx.new(|_| Lamp {
+                lit: false,
+                width: 40.,
+                renders,
+                clicks: Rc::default(),
+            }),
+        });
+        cx.run_until_parked();
+        let lamp = popover.read_with(cx, |popover, _| popover.lamp.clone());
+        for lit in [true, false, true] {
+            lamp.update(cx, |lamp, cx| {
+                lamp.lit = lit;
+                cx.repaint();
+            });
+            cx.run_until_parked();
+            let shown = if lit { "lit" } else { "dim" };
+            assert!(cx.debug_bounds(shown).is_some(), "the lamp shows {shown}");
+        }
     }
 }
