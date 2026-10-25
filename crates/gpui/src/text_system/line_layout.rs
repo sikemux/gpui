@@ -149,16 +149,31 @@ impl LineLayout {
         self.width
     }
 
-    /// Whether each glyph sits at or right of the one before it in reading order, as in
-    /// left-to-right text. Right-to-left text breaks this, and the layout is then measured by
-    /// where its glyphs sit rather than by the order they are read in.
+    /// Whether each glyph sits at or right of the one before it and draws a character at or after
+    /// it, as in left-to-right text. Right-to-left text breaks one of the two, depending on whether
+    /// the shaper hands its glyphs over in reading order or in visual order, and the layout is then
+    /// measured by where its glyphs sit rather than by the order they come in.
     pub fn reads_left_to_right(&self) -> bool {
-        let mut last = Pixels::MIN;
+        let mut last = (0, Pixels::MIN);
         self.runs.iter().flat_map(|run| &run.glyphs).all(|glyph| {
-            let ordered = glyph.position.x >= last;
-            last = glyph.position.x;
+            let ordered = glyph.index >= last.0 && glyph.position.x >= last.1;
+            last = (glyph.index, glyph.position.x);
             ordered
         })
+    }
+
+    /// Each glyph's run and its place in that run, in reading order. Shapers hand right-to-left
+    /// glyphs over in visual order or in a mix of both, so the character each glyph draws decides
+    /// the order, and glyphs drawing the same character keep the order they were shaped in.
+    fn reading_order(&self) -> Vec<(usize, usize)> {
+        let mut glyphs = self
+            .runs
+            .iter()
+            .enumerate()
+            .flat_map(|(run_ix, run)| (0..run.glyphs.len()).map(move |glyph_ix| (run_ix, glyph_ix)))
+            .collect::<Vec<_>>();
+        glyphs.sort_by_key(|&(run_ix, glyph_ix)| self.runs[run_ix].glyphs[glyph_ix].index);
+        glyphs
     }
 
     /// Where each glyph falls once this layout is wrapped at `boundaries`, for a layout that does
@@ -166,12 +181,7 @@ impl LineLayout {
     /// wrapped line lays the glyphs between two boundaries side by side in the order they sat
     /// unwrapped, so right-to-left text still reads from the right on every line.
     pub(crate) fn bidi_lines(&self, boundaries: &[WrapBoundary]) -> BidiLines {
-        let glyphs = self
-            .runs
-            .iter()
-            .enumerate()
-            .flat_map(|(run_ix, run)| (0..run.glyphs.len()).map(move |glyph_ix| (run_ix, glyph_ix)))
-            .collect::<Vec<_>>();
+        let glyphs = self.reading_order();
         let x_of = |flat: usize| {
             let (run_ix, glyph_ix) = glyphs[flat];
             self.runs[run_ix].glyphs[glyph_ix].position.x
@@ -186,9 +196,13 @@ impl LineLayout {
         }
 
         let mut starts = vec![0];
-        starts.extend(boundaries.iter().map(|boundary| {
-            glyphs.partition_point(|&glyph| glyph < (boundary.run_ix, boundary.glyph_ix))
+        starts.extend(boundaries.iter().filter_map(|boundary| {
+            glyphs
+                .iter()
+                .position(|&glyph| glyph == (boundary.run_ix, boundary.glyph_ix))
         }));
+        starts.sort_unstable();
+        starts.dedup();
         let mut x = vec![Pixels::ZERO; glyphs.len()];
         let mut widths = vec![Pixels::ZERO; starts.len()];
         for &flat in &order {
@@ -303,51 +317,51 @@ impl LineLayout {
         let mut first_non_whitespace_ix = None;
         let mut last_candidate_ix = None;
         let mut last_candidate_x = px(0.);
-        let mut last_boundary = WrapBoundary {
-            run_ix: 0,
-            glyph_ix: 0,
-        };
+        let mut last_boundary_at = 0;
         let mut last_boundary_x = px(0.);
         let mut prev_ch = '\0';
-        // right-to-left glyphs sit out of reading order, so each is measured by how much of the
-        // line it covers, and those widths are laid end to end in reading order
-        let offsets = (!self.reads_left_to_right()).then(|| {
-            let lines = self.bidi_lines(&[]);
-            let mut offsets = Vec::with_capacity(lines.advance.len() + 1);
-            let mut at = Pixels::ZERO;
-            for advance in lines.advance {
-                offsets.push(at);
-                at += advance;
+        // right-to-left glyphs sit out of reading order, so they are walked in reading order, each
+        // measured by how much of the line it covers and laid end to end
+        let (order, end) = match self.reads_left_to_right() {
+            true => (
+                self.runs
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(run_ix, run)| {
+                        run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
+                            (WrapBoundary { run_ix, glyph_ix }, glyph.position.x)
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                self.width,
+            ),
+            false => {
+                let lines = self.bidi_lines(&[]);
+                let mut at = Pixels::ZERO;
+                let order = lines
+                    .glyphs
+                    .iter()
+                    .zip(&lines.advance)
+                    .map(|(&(run_ix, glyph_ix), &advance)| {
+                        let x = at;
+                        at += advance;
+                        (WrapBoundary { run_ix, glyph_ix }, x)
+                    })
+                    .collect::<Vec<_>>();
+                (order, at)
             }
-            offsets.push(at);
-            offsets
-        });
-        let end = offsets
-            .as_ref()
-            .and_then(|offsets| offsets.last().copied())
-            .unwrap_or(self.width);
-        let mut glyphs = self
-            .runs
-            .iter()
+        };
+        let mut glyphs = order
+            .into_iter()
             .enumerate()
-            .flat_map(move |(run_ix, run)| {
-                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                    let character = text[glyph.index..].chars().next().unwrap();
-                    (
-                        WrapBoundary { run_ix, glyph_ix },
-                        character,
-                        glyph.position.x,
-                    )
-                })
-            })
-            .enumerate()
-            .map(|(flat, (boundary, character, x))| {
-                let x = offsets.as_ref().map_or(x, |offsets| offsets[flat]);
-                (boundary, character, x)
+            .map(|(at, (boundary, x))| {
+                let index = self.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+                let character = text[index..].chars().next().unwrap();
+                (at, boundary, character, x)
             })
             .peekable();
 
-        while let Some((boundary, ch, x)) = glyphs.next() {
+        while let Some((at, boundary, ch, x)) = glyphs.next() {
             if ch == '\n' {
                 continue;
             }
@@ -356,12 +370,12 @@ impl LineLayout {
             // but there are some differences, so we have to duplicate the code here.
             if LineWrapper::is_word_char(ch) {
                 if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
+                    last_candidate_ix = Some((boundary, at));
                     last_candidate_x = x;
                 }
             } else {
                 if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
+                    last_candidate_ix = Some((boundary, at));
                     last_candidate_x = x;
                 }
             }
@@ -370,10 +384,10 @@ impl LineLayout {
                 first_non_whitespace_ix = Some(boundary);
             }
 
-            let next_x = glyphs.peek().map_or(end, |(_, _, x)| *x);
+            let next_x = glyphs.peek().map_or(end, |(_, _, _, x)| *x);
             let width = next_x - last_boundary_x;
 
-            if width > wrap_width && boundary > last_boundary {
+            if width > wrap_width && at > last_boundary_at {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -381,14 +395,18 @@ impl LineLayout {
                     break;
                 }
 
-                if let Some(last_candidate_ix) = last_candidate_ix.take() {
-                    last_boundary = last_candidate_ix;
-                    last_boundary_x = last_candidate_x;
-                } else {
-                    last_boundary = boundary;
-                    last_boundary_x = x;
-                }
-                boundaries.push(last_boundary);
+                let (wrap_at, wrap_at_x) = match last_candidate_ix.take() {
+                    Some((candidate, candidate_at)) => {
+                        last_boundary_at = candidate_at;
+                        (candidate, last_candidate_x)
+                    }
+                    None => {
+                        last_boundary_at = at;
+                        (boundary, x)
+                    }
+                };
+                last_boundary_x = wrap_at_x;
+                boundaries.push(wrap_at);
             }
             prev_ch = ch;
         }
