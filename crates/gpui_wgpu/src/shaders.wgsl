@@ -97,6 +97,9 @@ struct GammaParams {
 @group(2) @binding(1) var s_sprite: sampler;
 
 const M_PI_F: f32 = 3.1415926;
+// How much further along each edge a fully smoothed corner starts than a round one, as a share
+// of its radius. The same as `SQUIRCLE_REACH` in gpui.
+const SQUIRCLE_REACH: f32 = 0.528665;
 const GRAYSCALE_FACTORS: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
 
 struct Bounds {
@@ -359,31 +362,57 @@ fn pick_corner_radius(center_to_point: vec2<f32>, radii: Corners) -> f32 {
 //
 // See comments on similar code using `quad_sdf_impl` in `fs_quad` for
 // explanation.
-fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
+fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners, corner_smoothing: f32) -> f32 {
     let half_size = bounds.size / 2.0;
     let center = bounds.origin + half_size;
     let center_to_point = point - center;
-    let corner_radius = pick_corner_radius(center_to_point, corner_radii);
+    let corner = corner_shape(pick_corner_radius(center_to_point, corner_radii), corner_smoothing,
+        half_size);
     let corner_to_point = abs(center_to_point) - half_size;
-    let corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius);
+    let corner_center_to_point = corner_to_point + corner.x;
+    return quad_sdf_impl(corner_center_to_point, corner.x, corner.y);
 }
 
-fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32) -> f32 {
+// The shape of a corner of `radius` smoothed by `smoothing`: how far along each edge it starts,
+// and the exponent of the superellipse it follows, 2 for a circular arc. The exponent is picked
+// so that the corner crosses its diagonal where a round corner of `radius` would, which keeps
+// it the same size to the eye. A corner with no room to reach further stays round.
+fn corner_shape(radius: f32, smoothing: f32, half_size: vec2<f32>) -> vec2<f32> {
+    if (smoothing <= 0.0 || radius <= 0.0) {
+        return vec2<f32>(radius, 2.0);
+    }
+    let room = min(half_size.x, half_size.y);
+    let extent = max(radius, min(radius * (1.0 + SQUIRCLE_REACH * smoothing), room));
+    let inset = (1.0 - sqrt(0.5)) * radius / extent;
+    return vec2<f32>(extent, -1.0 / log2(1.0 - inset));
+}
+
+fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32, corner_exponent: f32) -> f32 {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners.
         return max(corner_center_to_point.x, corner_center_to_point.y);
     } else {
-        // Signed distance of the point from a quad that is inset by corner_radius.
-        // It is negative inside this quad, and positive outside.
-        let signed_distance_to_inset_quad =
-            // 0 inside the inset quad, and positive outside.
-            length(max(vec2<f32>(0.0), corner_center_to_point)) +
-            // 0 outside the inset quad, and negative inside.
-            min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
-
-        return signed_distance_to_inset_quad - corner_radius;
+        // 0 inside the quad inset by corner_radius, and positive outside.
+        let outside = max(vec2<f32>(0.0), corner_center_to_point);
+        // 0 outside the inset quad, and negative inside.
+        let inside = min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
+        if (corner_exponent == 2.0) {
+            return length(outside) + inside - corner_radius;
+        }
+        return superellipse_sdf(outside, corner_radius, corner_exponent) + inside;
     }
+}
+
+// Signed distance from a point, measured from a corner's center, to a superellipse corner of
+// `radius` and `exponent`. The superellipse's norm divided by the length of its gradient is a
+// true distance near the curve, which is where antialiasing reads it.
+fn superellipse_sdf(point: vec2<f32>, radius: f32, exponent: f32) -> f32 {
+    let norm = pow(pow(point.x, exponent) + pow(point.y, exponent), 1.0 / exponent);
+    if (norm <= 0.0) {
+        return -radius;
+    }
+    let slope = length(pow(point / norm, vec2<f32>(exponent - 1.0)));
+    return (norm - radius) / slope;
 }
 
 // Abstract away the final color transformation based on the
@@ -525,6 +554,8 @@ struct Quad {
     border_color: Hsla,
     corner_radii: Corners,
     border_widths: Edges,
+    corner_smoothing: f32,
+    pad: u32,
 }
 
 struct QuadVarying {
@@ -596,8 +627,10 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // minimum distance between the center of the pixel and the edge.
     let antialias_threshold = 0.5;
 
-    // Radius of the nearest corner
-    let corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
+    // How far along the edges the nearest corner reaches, and the exponent of its curve
+    let corner = corner_shape(pick_corner_radius(center_to_point, quad.corner_radii),
+        quad.corner_smoothing, half_size);
+    let corner_radius = corner.x;
 
     // Width of the nearest borders
     let border = vec2<f32>(
@@ -655,7 +688,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     // Signed distance of the point to the outside edge of the quad's border. It
     // is positive outside this edge, and negative inside.
-    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius, corner.y);
 
     // Approximate signed distance of the point to the inside edge of the quad's
     // border. It is negative outside this edge (within the border), and
@@ -673,9 +706,10 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     } else if (is_beyond_inner_straight_border) {
         // Fast path for points that must be outside the inner edge.
         inner_sdf = -1.0;
-    } else if (reduced_border.x == reduced_border.y) {
-        // Fast path for circular inner edge.
-        inner_sdf = -(outer_sdf + reduced_border.x);
+    } else if (reduced_border.x == reduced_border.y || corner.y != 2.0) {
+        // Fast path for circular inner edge. A smoothed corner offsets its outer edge by the
+        // wider border, since its inner edge has no exact form either way.
+        inner_sdf = -(outer_sdf + max(reduced_border.x, reduced_border.y));
     } else {
         let ellipse_radii = max(vec2<f32>(0.0), corner_radius - reduced_border);
         inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
@@ -961,7 +995,7 @@ struct Shadow {
     element_corner_radii: Corners,
     // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
-    pad: u32, // align to 8 bytes
+    element_corner_smoothing: f32,
 }
 
 struct ShadowVarying {
@@ -1012,7 +1046,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
 
     var alpha: f32;
     if (shadow.blur_radius == 0.0) {
-        let distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        let distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii, 0.0);
         alpha = saturate(0.5 - distance);
     } else {
         // The signal is only non-zero in a limited range, so don't waste samples
@@ -1038,13 +1072,13 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
         let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                        shadow.element_corner_radii);
+                                        shadow.element_corner_radii, shadow.element_corner_smoothing);
         alpha *= saturate(0.5 - element_distance);
     } else {
         // A drop shadow is clipped to outside the element, the way CSS draws one, so an
         // element with a translucent fill never shows its own shadow through it.
         let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                        shadow.element_corner_radii);
+                                        shadow.element_corner_radii, shadow.element_corner_smoothing);
         alpha *= saturate(0.5 + element_distance);
     }
 
@@ -1306,7 +1340,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     }
 
     let sprite = load_poly_sprite(input.sprite_id);
-    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii, 0.0);
 
     var color = sample;
     if (sprite.grayscale != 0u) {
@@ -1372,7 +1406,7 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
 struct Backdrop {
     order: u32,
-    pad: u32,
+    corner_smoothing: f32,
     blur: f32,
     opacity: f32,
     bounds: Bounds,
@@ -1416,7 +1450,7 @@ fn fs_backdrop(input: BackdropVarying) -> @location(0) vec4<f32> {
     let backdrop = load_backdrop(input.backdrop_id);
     let position = input.position.xy;
     let sampled = textureSample(t_sprite, s_sprite, position / globals.viewport_size);
-    let distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii);
+    let distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing);
     let coverage = saturate(0.5 - distance);
 
     return sampled * coverage * backdrop.opacity;
@@ -1432,7 +1466,7 @@ fn fs_backdrop_punch(input: BackdropVarying) -> @location(0) vec4<f32> {
 
     let backdrop = load_backdrop(input.backdrop_id);
     let position = input.position.xy;
-    let distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii);
+    let distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing);
     let coverage = saturate(0.5 - distance);
 
     return vec4<f32>(0.0, 0.0, 0.0, coverage * backdrop.opacity);
@@ -1472,12 +1506,17 @@ fn vs_blur(@builtin(vertex_index) vertex_id: u32) -> BlurVarying {
 @fragment
 fn fs_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
     let blur = load_blur(0u);
-    let texel = blur.direction / vec2<f32>(textureDimensions(t_sprite));
-    let sigma = max(blur.radius, 0.0001);
+    return gaussian_pass(input.uv, blur.direction, blur.radius);
+}
+
+// One gaussian pass along `direction` at `uv`, with `radius` as its standard deviation.
+fn gaussian_pass(uv: vec2<f32>, direction: vec2<f32>, radius: f32) -> vec4<f32> {
+    let texel = direction / vec2<f32>(textureDimensions(t_sprite));
+    let sigma = max(radius, 0.0001);
     let reach = min(ceil(sigma * 3.0), 24.0);
     let spread = 2.0 * sigma * sigma;
 
-    var total = textureSample(t_sprite, s_sprite, input.uv);
+    var total = textureSample(t_sprite, s_sprite, uv);
     var weight = 1.0;
     var inner = 1.0;
     while (inner <= reach) {
@@ -1486,8 +1525,8 @@ fn fs_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
         let outer_weight = select(0.0, exp(-outer * outer / spread), outer <= reach);
         let pair = inner_weight + outer_weight;
         let at = texel * ((inner * inner_weight + outer * outer_weight) / pair);
-        total += pair * textureSample(t_sprite, s_sprite, input.uv + at);
-        total += pair * textureSample(t_sprite, s_sprite, input.uv - at);
+        total += pair * textureSample(t_sprite, s_sprite, uv + at);
+        total += pair * textureSample(t_sprite, s_sprite, uv - at);
         weight += pair * 2.0;
         inner += 2.0;
     }
@@ -1549,15 +1588,60 @@ struct Mask {
 @fragment
 fn fs_mask(input: BlurVarying) -> @location(0) vec4<f32> {
     let mask = load_mask(0u);
-    let destination_point = input.position.xy;
-    let source_point = mask.transform_origin
+    let source_point = mask_source(mask, input.position.xy);
+    let coverage = mask_coverage(mask, source_point);
+    if (coverage <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    return textureSample(t_sprite, s_sprite, source_point / globals.viewport_size) * coverage;
+}
+
+// `fs_mask` for a layer the gaussian has only blurred across, which runs the pass down on the
+// way into the frame with `pad` as its standard deviation. It takes one tap per texel rather
+// than pairing them, so a source point between texel centres, as a transformed layer has, gets
+// the bilinear sample of what the pass down would have stored.
+@fragment
+fn fs_mask_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
+    let mask = load_mask(0u);
+    let source_point = mask_source(mask, input.position.xy);
+    let coverage = mask_coverage(mask, source_point);
+    if (coverage <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let uv = source_point / globals.viewport_size;
+    let texel = vec2<f32>(0.0, 1.0) / vec2<f32>(textureDimensions(t_sprite));
+    let sigma = max(mask.pad, 0.0001);
+    let reach = min(ceil(sigma * 3.0), 24.0);
+    let spread = 2.0 * sigma * sigma;
+
+    var total = textureSample(t_sprite, s_sprite, uv);
+    var weight = 1.0;
+    var tap = 1.0;
+    while (tap <= reach) {
+        let tap_weight = exp(-tap * tap / spread);
+        total += tap_weight * textureSample(t_sprite, s_sprite, uv + texel * tap);
+        total += tap_weight * textureSample(t_sprite, s_sprite, uv - texel * tap);
+        weight += tap_weight * 2.0;
+        tap += 1.0;
+    }
+    return total / weight * coverage;
+}
+
+// Where a destination pixel of a layer reads its source, undoing the layer's transform.
+fn mask_source(mask: Mask, destination_point: vec2<f32>) -> vec2<f32> {
+    return mask.transform_origin
         + (destination_point - mask.translation - mask.transform_origin) / mask.scale;
+}
+
+// How much of a layer's source point reaches the frame: nothing outside the source, and the
+// edge fades within it.
+fn mask_coverage(mask: Mask, source_point: vec2<f32>) -> f32 {
     let source_end = mask.source_bounds.origin + mask.source_bounds.size;
     if (any(source_point < mask.source_bounds.origin)
         || any(source_point >= source_end)
         || any(source_point < vec2<f32>(0.0))
         || any(source_point >= globals.viewport_size)) {
-        return vec4<f32>(0.0);
+        return 0.0;
     }
 
     let top = source_point.y - mask.fade_bounds.origin.y;
@@ -1579,6 +1663,5 @@ fn fs_mask(input: BlurVarying) -> @location(0) vec4<f32> {
         coverage = min(coverage, smoothstep(0.0, mask.fade_right, right));
     }
 
-    let sampled = textureSample(t_sprite, s_sprite, source_point / globals.viewport_size);
-    return sampled * coverage;
+    return coverage;
 }

@@ -26,8 +26,10 @@ float dash_alpha(float t, float period, float length, float dash_velocity,
 float quarter_ellipse_sdf(float2 point, float2 radii);
 float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_radii);
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
-               Corners_ScaledPixels corner_radii);
-float quad_sdf_impl(float2 center_to_point, float corner_radius);
+               Corners_ScaledPixels corner_radii, float corner_smoothing);
+float2 corner_shape(float radius, float smoothing, float2 half_size);
+float superellipse_sdf(float2 point, float radius, float exponent);
+float quad_sdf_impl(float2 center_to_point, float corner_radius, float corner_exponent);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
@@ -127,8 +129,10 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   // minimum distance between the center of the pixel and the edge.
   const float antialias_threshold = 0.5;
 
-  // Radius of the nearest corner
-  float corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
+  // How far along the edges the nearest corner reaches, and the exponent of its curve
+  float2 corner = corner_shape(pick_corner_radius(center_to_point, quad.corner_radii),
+                               quad.corner_smoothing, half_size);
+  float corner_radius = corner.x;
 
   // Width of the nearest borders
   float2 border = float2(
@@ -179,7 +183,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   }
 
   // Signed distance of the point to the outside edge of the quad's border
-  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius, corner.y);
 
   // Approximate signed distance of the point to the inside edge of the quad's
   // border. It is negative outside this edge (within the border), and
@@ -197,9 +201,10 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   } else if (is_beyond_inner_straight_border) {
     // Fast path for points that must be outside the inner edge
     inner_sdf = -1.0;
-  } else if (reduced_border.x == reduced_border.y) {
-    // Fast path for circular inner edge.
-    inner_sdf = -(outer_sdf + reduced_border.x);
+  } else if (reduced_border.x == reduced_border.y || corner.y != 2.0) {
+    // Fast path for circular inner edge. A smoothed corner offsets its outer edge by the
+    // wider border, since its inner edge has no exact form either way.
+    inner_sdf = -(outer_sdf + max(reduced_border.x, reduced_border.y));
   } else {
     float2 ellipse_radii = max(float2(0.0), float2(corner_radius) - reduced_border);
     inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
@@ -521,7 +526,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 
   float alpha;
   if (shadow.blur_radius == 0.) {
-    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii, 0.0);
     alpha = saturate(0.5 - distance);
   } else {
     // The signal is only non-zero in a limited range, so don't waste samples
@@ -547,13 +552,13 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
     alpha = 1. - alpha;
     float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                      shadow.element_corner_radii);
+                                      shadow.element_corner_radii, shadow.element_corner_smoothing);
     alpha *= saturate(0.5 - element_distance);
   } else {
     // A drop shadow is clipped to outside the element, the way CSS draws one, so an
     // element with a translucent fill never shows its own shadow through it.
     float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                      shadow.element_corner_radii);
+                                      shadow.element_corner_radii, shadow.element_corner_smoothing);
     alpha *= saturate(0.5 + element_distance);
   }
 
@@ -724,7 +729,7 @@ fragment float4 polychrome_sprite_fragment(
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii, 0.0);
 
   float4 color = sample;
   if (sprite.grayscale) {
@@ -1067,31 +1072,62 @@ float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_rad
 // Signed distance of the point to the quad's border - positive outside the
 // border, and negative inside.
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
-               Corners_ScaledPixels corner_radii) {
+               Corners_ScaledPixels corner_radii, float corner_smoothing) {
     float2 half_size = float2(bounds.size.width, bounds.size.height) / 2.0;
     float2 center = float2(bounds.origin.x, bounds.origin.y) + half_size;
     float2 center_to_point = point - center;
-    float corner_radius = pick_corner_radius(center_to_point, corner_radii);
+    float2 corner = corner_shape(pick_corner_radius(center_to_point, corner_radii),
+                                 corner_smoothing, half_size);
     float2 corner_to_point = fabs(center_to_point) - half_size;
-    float2 corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius);
+    float2 corner_center_to_point = corner_to_point + corner.x;
+    return quad_sdf_impl(corner_center_to_point, corner.x, corner.y);
+}
+
+// How much further along each edge a fully smoothed corner starts than a round one, as a share
+// of its radius. The same as `SQUIRCLE_REACH` in gpui.
+constant float SQUIRCLE_REACH = 0.528665;
+
+// The shape of a corner of `radius` smoothed by `smoothing`: how far along each edge it starts,
+// and the exponent of the superellipse it follows, 2 for a circular arc. The exponent is picked
+// so that the corner crosses its diagonal where a round corner of `radius` would, which keeps
+// it the same size to the eye. A corner with no room to reach further stays round.
+float2 corner_shape(float radius, float smoothing, float2 half_size) {
+    if (smoothing <= 0.0 || radius <= 0.0) {
+        return float2(radius, 2.0);
+    }
+    float room = min(half_size.x, half_size.y);
+    float extent = max(radius, min(radius * (1.0 + SQUIRCLE_REACH * smoothing), room));
+    float inset = (1.0 - sqrt(0.5)) * radius / extent;
+    return float2(extent, -1.0 / log2(1.0 - inset));
+}
+
+// Signed distance from a point, measured from a corner's center, to a superellipse corner of
+// `radius` and `exponent`. The superellipse's norm divided by the length of its gradient is a
+// true distance near the curve, which is where antialiasing reads it.
+float superellipse_sdf(float2 point, float radius, float exponent) {
+    float2 component = fabs(point);
+    float norm = powr(powr(component.x, exponent) + powr(component.y, exponent), 1.0 / exponent);
+    if (norm <= 0.0) {
+        return -radius;
+    }
+    float slope = length(powr(component / norm, float2(exponent - 1.0)));
+    return (norm - radius) / slope;
 }
 
 // Implementation of quad signed distance field
-float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
+float quad_sdf_impl(float2 corner_center_to_point, float corner_radius, float corner_exponent) {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners
         return max(corner_center_to_point.x, corner_center_to_point.y);
     } else {
-        // Signed distance of the point from a quad that is inset by corner_radius
-        // It is negative inside this quad, and positive outside
-        float signed_distance_to_inset_quad =
-            // 0 inside the inset quad, and positive outside
-            length(max(float2(0.0), corner_center_to_point)) +
-            // 0 outside the inset quad, and negative inside
-            min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
-
-        return signed_distance_to_inset_quad - corner_radius;
+        // 0 inside the quad inset by corner_radius, and positive outside
+        float2 outside = max(float2(0.0), corner_center_to_point);
+        // 0 outside the inset quad, and negative inside
+        float inside = min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
+        if (corner_exponent == 2.0) {
+            return length(outside) + inside - corner_radius;
+        }
+        return superellipse_sdf(outside, corner_radius, corner_exponent) + inside;
     }
 }
 
@@ -1351,7 +1387,7 @@ fragment float4 backdrop_fragment(
   float2 position = input.position.xy;
   float2 extent = float2(float(viewport_size->width), float(viewport_size->height));
   float4 sampled = source.sample(source_sampler, position / extent);
-  float distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii);
+  float distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing);
   float coverage = saturate(0.5 - distance);
 
   return sampled * coverage * backdrop.opacity;
@@ -1371,7 +1407,7 @@ fragment float4 backdrop_punch_fragment(
 
   Backdrop backdrop = backdrops[input.backdrop_id];
   float2 position = input.position.xy;
-  float distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii);
+  float distance = quad_sdf(position, backdrop.bounds, backdrop.corner_radii, backdrop.corner_smoothing);
   float coverage = saturate(0.5 - distance);
 
   return float4(0.0, 0.0, 0.0, coverage * backdrop.opacity);

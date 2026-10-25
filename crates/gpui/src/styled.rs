@@ -502,6 +502,20 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Smooths the element's rounded corners from circular arcs towards a squircle. 0 keeps them
+    /// round and 1 makes them close to the continuous corners of iOS, which start further along
+    /// each edge and ease into it without a visible seam. The radius set with `rounded` stays the
+    /// size of the corner, and a corner that already fills half the element stays round.
+    fn corner_smoothing(mut self, smoothing: f32) -> Self {
+        self.style().corner_smoothing = Some(smoothing.clamp(0., 1.));
+        self
+    }
+
+    /// Fully smooths the element's rounded corners. See [`Self::corner_smoothing`].
+    fn squircle(self) -> Self {
+        self.corner_smoothing(1.)
+    }
+
     /// Returns a mutable reference to the text style that has been configured on this element.
     fn text_style(&mut self) -> &mut TextStyleRefinement {
         let style: &mut StyleRefinement = self.style();

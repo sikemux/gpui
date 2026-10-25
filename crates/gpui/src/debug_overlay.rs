@@ -353,6 +353,8 @@ impl DebugFrameOverlay {
                 border_color: repaint_edge().opacity(left),
                 corner_radii: Corners::default(),
                 border_widths: Edges::all(ScaledPixels(edge)),
+                corner_smoothing: 0.,
+                pad: 0,
             });
         }
     }
@@ -448,6 +450,8 @@ fn solid_quad(
         border_color: transparent_black(),
         corner_radii: Corners::default(),
         border_widths: Edges::default(),
+        corner_smoothing: 0.,
+        pad: 0,
     }
 }
 

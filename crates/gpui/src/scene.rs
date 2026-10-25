@@ -1152,7 +1152,8 @@ impl PrimitiveBatch {
 #[expect(missing_docs)]
 pub struct Backdrop {
     pub order: DrawOrder,
-    pub pad: u32,
+    /// How far the corners are smoothed from circular arcs towards a squircle, from 0 to 1.
+    pub corner_smoothing: f32,
     /// The standard deviation of the blur, in scaled pixels.
     pub blur: f32,
     /// How much of the blurred backdrop shows through.
@@ -1180,6 +1181,9 @@ pub struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+    /// How far the corners are smoothed from circular arcs towards a squircle, from 0 to 1.
+    pub corner_smoothing: f32,
+    pub pad: u32, // align to 8 bytes
 }
 
 impl From<Quad> for Primitive {
@@ -1221,7 +1225,8 @@ pub struct Shadow {
     pub element_corner_radii: Corners<ScaledPixels>,
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
-    pub pad: u32, // align to 8 bytes
+    /// The corner smoothing of the element's own outline, which clips the shadow.
+    pub element_corner_smoothing: f32,
 }
 
 impl From<Shadow> for Primitive {
@@ -1408,8 +1413,8 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub image_buffer: objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>,
 }
 
 impl From<PaintSurface> for Primitive {

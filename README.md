@@ -1,44 +1,53 @@
 # gpui
 
-[Sonora](https://github.com/sonorahq/sonora)'s fork of [GPUI](https://github.com/zed-industries/zed), the GPU-accelerated UI framework behind
-Zed.
+[Sonora](https://github.com/sonorahq/sonora)'s fork of [GPUI](https://github.com/zed-industries/zed),
+the GPU-accelerated UI framework behind Zed. Everything below works on wgpu, Metal and DirectX.
 
-This fork extends upstream GPUI with additional rendering, animation, and debugging capabilities:
+## What the fork adds
 
-- **Visual effects**
-  - `Styled::text_blur` — Gaussian blur baked into glyph rasterization and cached in the atlas
-  - `Styled::backdrop_blur` — CSS-style `backdrop-filter: blur()`
-  - `Styled::blur` — blur an element and its subtree as a composited layer
-  - Edge and side fading for composited layers
+- **Shapes and shadows**
+  - `Styled::corner_smoothing` and `Styled::squircle` for squircle corners
+  - `Styled::text_shadow` for CSS-style text shadows
+  - Box shadows clipped to outside their element
+
+- **Blur and layers**
+  - `Styled::blur` blurs an element and its subtree as a layer
+  - `Styled::backdrop_blur`, like CSS `backdrop-filter: blur()`
+  - `Styled::fade_edges` and `Styled::fade_sides` fade a layer at its edges
+  - Dual Kawase blur, with a Gaussian for small radii
+  - Neighbouring layers with the same filter merge into one pass
+  - `GPUI_FILTERS=0` turns layer filters off
 
 - **Paint-only transforms**
-  - `Styled::layer_scale` — scale an element and its subtree without affecting layout
-  - `Styled::layer_scale_origin` — choose the origin of a layer scale
-  - `Styled::layer_translate` — translate a composited layer without affecting layout or hitboxes
-  - Fractional/subpixel transforms suitable for smooth spring animations
+  - `Styled::layer_scale` and `Styled::layer_scale_origin`
+  - `Styled::layer_translate`, which leaves layout and hitboxes alone
+  - Fractional values for smooth spring animations
 
-- **Subpixel rendering**
-  - Optional pixel-snapping control for subtrees via `Window::with_pixel_snapping`
-  - Smooth fractional positioning without layout positions being rounded to device pixels
+- **Pixel snapping**
+  - `Window::with_pixel_snapping` keeps a subtree off the pixel grid
 
-- **Text rendering**
-  - Proper font-weight handling in the `cosmic-text` backend
-  - Variable-font `wght` axis support
+- **Text**
+  - Requested font weights honoured in cosmic-text
+  - Variable-font `wght` axis
   - Weight-aware font fallback
-  - Improved colour emoji font detection and rendering
+  - Colour emoji detection and rendering
+  - ClearType text inside layers on Windows and wgpu
+
+- **Memory**
+  - Offscreen targets allocated on first use and freed when idle
+  - Instance buffers shrink after a quiet period on wgpu and Metal
+  - Atlas tiles written straight to the wgpu queue
+
+- **App and windows**
+  - `App::hide_cursor` hides the cursor until the mouse moves
+  - Window controls keep their hitboxes in cached views
+  - Explicitly sized images keep their size
+  - Wayland edges kept off half device pixels, and better fractional scaling
 
 - **Profiling and debugging**
-  - Extended frame profiler with layout, prepaint, and paint timings
-  - View render/cache/dirty statistics
-  - Visual surface repaint highlighting
-  - Notify/re-render diagnostics
-  - Environment-controlled profiler and repaint overlays
-
-- **Platform and rendering fixes**
-  - Layer-filter support across WGPU, Metal, and DirectX renderers
-  - Improved Wayland fractional-scaling behaviour
-  - Fixes for half-device-pixel window edges and backdrop artefacts
-  - Additional renderer fixes for filtered and transformed layers
+  - `GPUI_DEBUG_OVERLAY=minimal|full` for frame timings and view statistics
+  - `GPUI_SHOW_REPAINTS=1` highlights what each frame redraws
+  - `GPUI_LOG_NOTIFIES=1` logs notifies and re-renders
 
 ## Licence
 
