@@ -56,11 +56,38 @@ pub struct ShapedGlyph {
     pub is_emoji: bool,
 }
 
+/// Where the glyphs of a layout fall once it is wrapped, for a layout whose glyphs do not sit left
+/// to right in reading order. Glyphs are numbered in reading order across all runs.
+pub(crate) struct BidiLines {
+    /// Each glyph's run and its place in that run.
+    pub(crate) glyphs: Vec<(usize, usize)>,
+    /// Each glyph's left edge, from the left edge of the wrapped line it falls on.
+    pub(crate) x: Vec<Pixels>,
+    /// How much of the line each glyph covers.
+    pub(crate) advance: Vec<Pixels>,
+    /// The glyphs on each wrapped line, and how wide that line is.
+    pub(crate) lines: Vec<(Range<usize>, Pixels)>,
+}
+
+/// The glyphs drawn for one or more characters, as one piece of a line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Cluster {
+    /// The byte index of the first character the cluster draws.
+    index: usize,
+    left: Pixels,
+    right: Pixels,
+    /// Whether the cluster is read right to left, which puts the caret before it on its right
+    /// edge.
+    rtl: bool,
+}
+
 impl LineLayout {
     /// The index for the character at the given x coordinate
     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
         if x >= self.width {
             None
+        } else if !self.reads_left_to_right() {
+            Some(cluster_at(&self.reading_clusters(), x))
         } else {
             for run in self.runs.iter().rev() {
                 for glyph in run.glyphs.iter().rev() {
@@ -76,6 +103,9 @@ impl LineLayout {
     /// closest_index_for_x returns the character boundary closest to the given x coordinate
     /// (e.g. to handle aligning up/down arrow keys)
     pub fn closest_index_for_x(&self, x: Pixels) -> usize {
+        if !self.reads_left_to_right() {
+            return closest_caret(&self.reading_clusters(), x, self.len);
+        }
         let mut prev_index = 0;
         let mut prev_x = px(0.);
 
@@ -106,6 +136,9 @@ impl LineLayout {
 
     /// The x position of the character at the given index
     pub fn x_for_index(&self, index: usize) -> Pixels {
+        if !self.reads_left_to_right() {
+            return caret_x(&self.reading_clusters(), index, self.width);
+        }
         for run in &self.runs {
             for glyph in &run.glyphs {
                 if glyph.index >= index {
@@ -114,6 +147,90 @@ impl LineLayout {
             }
         }
         self.width
+    }
+
+    /// Whether each glyph sits at or right of the one before it and draws a character at or after
+    /// it, as in left-to-right text. Right-to-left text breaks one of the two, depending on whether
+    /// the shaper hands its glyphs over in reading order or in visual order, and the layout is then
+    /// measured by where its glyphs sit rather than by the order they come in.
+    pub fn reads_left_to_right(&self) -> bool {
+        let mut last = (0, Pixels::MIN);
+        self.runs.iter().flat_map(|run| &run.glyphs).all(|glyph| {
+            let ordered = glyph.index >= last.0 && glyph.position.x >= last.1;
+            last = (glyph.index, glyph.position.x);
+            ordered
+        })
+    }
+
+    /// Each glyph's run and its place in that run, in reading order. Shapers hand right-to-left
+    /// glyphs over in visual order or in a mix of both, so the character each glyph draws decides
+    /// the order, and glyphs drawing the same character keep the order they were shaped in.
+    fn reading_order(&self) -> Vec<(usize, usize)> {
+        let mut glyphs = self
+            .runs
+            .iter()
+            .enumerate()
+            .flat_map(|(run_ix, run)| (0..run.glyphs.len()).map(move |glyph_ix| (run_ix, glyph_ix)))
+            .collect::<Vec<_>>();
+        glyphs.sort_by_key(|&(run_ix, glyph_ix)| self.runs[run_ix].glyphs[glyph_ix].index);
+        glyphs
+    }
+
+    /// Where each glyph falls once this layout is wrapped at `boundaries`, for a layout that does
+    /// not read left to right. Each glyph covers the line up to the next glyph to its right, and a
+    /// wrapped line lays the glyphs between two boundaries side by side in the order they sat
+    /// unwrapped, so right-to-left text still reads from the right on every line.
+    pub(crate) fn bidi_lines(&self, boundaries: &[WrapBoundary]) -> BidiLines {
+        let glyphs = self.reading_order();
+        let x_of = |flat: usize| {
+            let (run_ix, glyph_ix) = glyphs[flat];
+            self.runs[run_ix].glyphs[glyph_ix].position.x
+        };
+
+        let mut order = (0..glyphs.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&flat| x_of(flat));
+        let mut advance = vec![Pixels::ZERO; glyphs.len()];
+        for (at, &flat) in order.iter().enumerate() {
+            let right = order.get(at + 1).map_or(self.width, |&next| x_of(next));
+            advance[flat] = (right - x_of(flat)).max(Pixels::ZERO);
+        }
+
+        let mut starts = vec![0];
+        starts.extend(boundaries.iter().filter_map(|boundary| {
+            glyphs
+                .iter()
+                .position(|&glyph| glyph == (boundary.run_ix, boundary.glyph_ix))
+        }));
+        starts.sort_unstable();
+        starts.dedup();
+        let mut x = vec![Pixels::ZERO; glyphs.len()];
+        let mut widths = vec![Pixels::ZERO; starts.len()];
+        for &flat in &order {
+            let line = starts.partition_point(|&start| start <= flat) - 1;
+            x[flat] = widths[line];
+            widths[line] += advance[flat];
+        }
+        let ends = starts.iter().skip(1).copied().chain([glyphs.len()]);
+        let lines = starts
+            .iter()
+            .copied()
+            .zip(ends)
+            .zip(widths)
+            .map(|((start, end), width)| (start..end, width))
+            .collect();
+
+        BidiLines {
+            glyphs,
+            x,
+            advance,
+            lines,
+        }
+    }
+
+    /// The clusters of this layout as it sits unwrapped, in reading order.
+    fn reading_clusters(&self) -> Vec<Cluster> {
+        let lines = self.bidi_lines(&[]);
+        clusters(self, &lines, 0..lines.glyphs.len())
     }
 
     /// The corresponding Font at the given index
@@ -200,29 +317,51 @@ impl LineLayout {
         let mut first_non_whitespace_ix = None;
         let mut last_candidate_ix = None;
         let mut last_candidate_x = px(0.);
-        let mut last_boundary = WrapBoundary {
-            run_ix: 0,
-            glyph_ix: 0,
-        };
+        let mut last_boundary_at = 0;
         let mut last_boundary_x = px(0.);
         let mut prev_ch = '\0';
-        let mut glyphs = self
-            .runs
-            .iter()
+        // right-to-left glyphs sit out of reading order, so they are walked in reading order, each
+        // measured by how much of the line it covers and laid end to end
+        let (order, end) = match self.reads_left_to_right() {
+            true => (
+                self.runs
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(run_ix, run)| {
+                        run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
+                            (WrapBoundary { run_ix, glyph_ix }, glyph.position.x)
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                self.width,
+            ),
+            false => {
+                let lines = self.bidi_lines(&[]);
+                let mut at = Pixels::ZERO;
+                let order = lines
+                    .glyphs
+                    .iter()
+                    .zip(&lines.advance)
+                    .map(|(&(run_ix, glyph_ix), &advance)| {
+                        let x = at;
+                        at += advance;
+                        (WrapBoundary { run_ix, glyph_ix }, x)
+                    })
+                    .collect::<Vec<_>>();
+                (order, at)
+            }
+        };
+        let mut glyphs = order
+            .into_iter()
             .enumerate()
-            .flat_map(move |(run_ix, run)| {
-                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                    let character = text[glyph.index..].chars().next().unwrap();
-                    (
-                        WrapBoundary { run_ix, glyph_ix },
-                        character,
-                        glyph.position.x,
-                    )
-                })
+            .map(|(at, (boundary, x))| {
+                let index = self.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+                let character = text[index..].chars().next().unwrap();
+                (at, boundary, character, x)
             })
             .peekable();
 
-        while let Some((boundary, ch, x)) = glyphs.next() {
+        while let Some((at, boundary, ch, x)) = glyphs.next() {
             if ch == '\n' {
                 continue;
             }
@@ -231,12 +370,12 @@ impl LineLayout {
             // but there are some differences, so we have to duplicate the code here.
             if LineWrapper::is_word_char(ch) {
                 if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
+                    last_candidate_ix = Some((boundary, at));
                     last_candidate_x = x;
                 }
             } else {
                 if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
+                    last_candidate_ix = Some((boundary, at));
                     last_candidate_x = x;
                 }
             }
@@ -245,10 +384,10 @@ impl LineLayout {
                 first_non_whitespace_ix = Some(boundary);
             }
 
-            let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
+            let next_x = glyphs.peek().map_or(end, |(_, _, _, x)| *x);
             let width = next_x - last_boundary_x;
 
-            if width > wrap_width && boundary > last_boundary {
+            if width > wrap_width && at > last_boundary_at {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -256,14 +395,18 @@ impl LineLayout {
                     break;
                 }
 
-                if let Some(last_candidate_ix) = last_candidate_ix.take() {
-                    last_boundary = last_candidate_ix;
-                    last_boundary_x = last_candidate_x;
-                } else {
-                    last_boundary = boundary;
-                    last_boundary_x = x;
-                }
-                boundaries.push(last_boundary);
+                let (wrap_at, wrap_at_x) = match last_candidate_ix.take() {
+                    Some((candidate, candidate_at)) => {
+                        last_boundary_at = candidate_at;
+                        (candidate, last_candidate_x)
+                    }
+                    None => {
+                        last_boundary_at = at;
+                        (boundary, x)
+                    }
+                };
+                last_boundary_x = wrap_at_x;
+                boundaries.push(wrap_at);
             }
             prev_ch = ch;
         }
@@ -1069,6 +1212,90 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
     }
 }
 
+/// The clusters among `range` of `lines`, in reading order, each with the side it is read from.
+fn clusters(layout: &LineLayout, lines: &BidiLines, range: Range<usize>) -> Vec<Cluster> {
+    let mut clusters: Vec<Cluster> = Vec::new();
+    for flat in range {
+        let (run_ix, glyph_ix) = lines.glyphs[flat];
+        let index = layout.runs[run_ix].glyphs[glyph_ix].index;
+        let left = lines.x[flat];
+        let right = left + lines.advance[flat];
+        match clusters.last_mut() {
+            Some(last) if last.index == index => {
+                last.left = last.left.min(left);
+                last.right = last.right.max(right);
+            }
+            _ => clusters.push(Cluster {
+                index,
+                left,
+                right,
+                rtl: false,
+            }),
+        }
+    }
+
+    // a cluster reads right to left when what is read after it sits to its left, or what is read
+    // before it sits to its right
+    let lefts = clusters
+        .iter()
+        .map(|cluster| cluster.left)
+        .collect::<Vec<_>>();
+    for (at, cluster) in clusters.iter_mut().enumerate() {
+        let next = lefts.get(at + 1).is_some_and(|&next| next < cluster.left);
+        let previous = at
+            .checked_sub(1)
+            .is_some_and(|before| lefts[before] > cluster.left);
+        cluster.rtl = next || previous;
+    }
+    clusters
+}
+
+/// Where the caret before byte `index` sits among `clusters`: on the edge of the cluster it comes
+/// before that is read first, or past the last cluster on its far side.
+fn caret_x(clusters: &[Cluster], index: usize, end: Pixels) -> Pixels {
+    let edge = |cluster: &Cluster, before: bool| match cluster.rtl == before {
+        true => cluster.right,
+        false => cluster.left,
+    };
+    match clusters.iter().find(|cluster| cluster.index >= index) {
+        Some(cluster) => edge(cluster, true),
+        None => clusters.last().map_or(end, |last| edge(last, false)),
+    }
+}
+
+/// The byte index of the caret position nearest `x`. Each cluster offers the caret before it and
+/// the one after it, on its two edges.
+fn closest_caret(clusters: &[Cluster], x: Pixels, len: usize) -> usize {
+    let mut closest = (len, Pixels::MAX);
+    for (at, cluster) in clusters.iter().enumerate() {
+        let after = clusters.get(at + 1).map_or(len, |next| next.index);
+        let (before_x, after_x) = match cluster.rtl {
+            true => (cluster.right, cluster.left),
+            false => (cluster.left, cluster.right),
+        };
+        for (index, edge) in [(cluster.index, before_x), (after, after_x)] {
+            let distance = (edge - x).abs();
+            if distance < closest.1 {
+                closest = (index, distance);
+            }
+        }
+    }
+    closest.0
+}
+
+/// The byte index of the cluster under `x`, or of the nearest one when `x` falls between them.
+fn cluster_at(clusters: &[Cluster], x: Pixels) -> usize {
+    clusters
+        .iter()
+        .find(|cluster| cluster.left <= x && x < cluster.right)
+        .or_else(|| {
+            clusters
+                .iter()
+                .min_by_key(|cluster| (cluster.left - x).abs().min((cluster.right - x).abs()))
+        })
+        .map_or(0, |cluster| cluster.index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1186,5 +1413,103 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    /// Four two-byte letters read right to left, each 10px wide, placed the way DirectWrite
+    /// places them: the first letter read sits at the right.
+    fn right_to_left() -> LineLayout {
+        LineLayout {
+            width: px(40.),
+            len: 8,
+            ..make_layout(vec![
+                glyph_at(30., 0),
+                glyph_at(20., 2),
+                glyph_at(10., 4),
+                glyph_at(0., 6),
+            ])
+        }
+    }
+
+    #[test]
+    fn left_to_right_text_keeps_its_own_measures() {
+        let layout = make_layout(vec![glyph_at(0., 0), glyph_at(8., 1), glyph_at(16., 2)]);
+        assert!(layout.reads_left_to_right());
+        assert_eq!(layout.x_for_index(1), px(8.));
+    }
+
+    #[test]
+    fn right_to_left_carets_sit_on_the_right_of_what_follows_them() {
+        let layout = right_to_left();
+        assert!(!layout.reads_left_to_right());
+
+        assert_eq!(layout.x_for_index(0), px(40.));
+        assert_eq!(layout.x_for_index(2), px(30.));
+        assert_eq!(layout.x_for_index(8), px(0.));
+
+        assert_eq!(layout.closest_index_for_x(px(39.)), 0);
+        assert_eq!(layout.closest_index_for_x(px(21.)), 4);
+        assert_eq!(layout.closest_index_for_x(px(1.)), 8);
+
+        assert_eq!(layout.index_for_x(px(35.)), Some(0));
+        assert_eq!(layout.index_for_x(px(5.)), Some(6));
+    }
+
+    #[test]
+    fn a_caret_among_right_to_left_letters_inside_left_to_right_text() {
+        // two right-to-left letters, a space and two latin ones: the two letters sit swapped
+        let layout = LineLayout {
+            width: px(50.),
+            len: 7,
+            ..make_layout(vec![
+                glyph_at(10., 0),
+                glyph_at(0., 2),
+                glyph_at(20., 4),
+                glyph_at(30., 5),
+                glyph_at(40., 6),
+            ])
+        };
+
+        assert_eq!(layout.x_for_index(0), px(20.));
+        assert_eq!(layout.x_for_index(2), px(10.));
+        assert_eq!(layout.x_for_index(5), px(30.));
+        assert_eq!(layout.x_for_index(7), px(50.));
+    }
+
+    #[test]
+    fn wrapped_right_to_left_lines_keep_reading_from_the_right() {
+        let layout = right_to_left();
+        let lines = layout.bidi_lines(&[WrapBoundary {
+            run_ix: 0,
+            glyph_ix: 2,
+        }]);
+
+        assert_eq!(lines.lines, vec![(0..2, px(20.)), (2..4, px(20.))]);
+        // the first letter read on each line sits at that line's right
+        assert_eq!(lines.x, vec![px(10.), px(0.), px(10.), px(0.)]);
+    }
+
+    #[test]
+    fn right_to_left_text_wraps_between_its_words() {
+        // "אב גד": two Hebrew words, each letter 10px, read from the right
+        let layout = LineLayout {
+            width: px(50.),
+            len: 9,
+            ..make_layout(vec![
+                glyph_at(40., 0),
+                glyph_at(30., 2),
+                glyph_at(20., 4),
+                glyph_at(10., 5),
+                glyph_at(0., 7),
+            ])
+        };
+
+        let boundaries = layout.compute_wrap_boundaries("אב גד", px(35.), None);
+        assert_eq!(
+            boundaries.as_slice(),
+            &[WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 3
+            }]
+        );
     }
 }
