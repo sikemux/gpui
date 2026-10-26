@@ -6010,9 +6010,7 @@ impl Window {
         );
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self
-            .text_system()
-            .glyph_dilation_for_color(color, scale_factor);
+        let dilation = self.text_system().glyph_dilation_for_color(color);
         let thinning = self
             .text_system()
             .glyph_thinning_for_color(color, scale_factor);
