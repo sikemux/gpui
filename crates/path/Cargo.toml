@@ -1,11 +1,12 @@
 [package]
-name = "path"
-version = "0.1.0"
+name = "gpui-pre-path"
+version = "0.3.10"
 edition.workspace = true
 publish.workspace = true
 license = "Apache-2.0"
 
 [lib]
+name = "path"
 path = "src/path.rs"
 doctest = false
 
