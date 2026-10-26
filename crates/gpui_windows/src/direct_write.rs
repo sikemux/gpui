@@ -469,6 +469,7 @@ impl DirectWriteState {
             ref fallbacks,
             weight,
             style,
+            ..
         }: &Font,
         collection: &IDWriteFontCollection1,
         factory: &IDWriteFactory5,
@@ -1794,6 +1795,8 @@ fn font_face_to_font(font_face: &IDWriteFontFace3, locale: &HSTRING) -> Option<F
         weight: font_weight_from_dwrite(weight),
         style: font_style_from_dwrite(style),
         fallbacks: None,
+        letter_spacing: Default::default(),
+        scale: Default::default(),
     })
 }
 
