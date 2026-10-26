@@ -41,8 +41,6 @@ pub struct ShapedRun {
     pub font_id: FontId,
     /// The glyphs that make up this run
     pub glyphs: Vec<ShapedGlyph>,
-    /// The size the run is drawn at, when it is not the line's
-    pub font_size: Option<Pixels>,
 }
 
 /// A single glyph, ready to paint.
@@ -59,6 +57,9 @@ pub struct ShapedGlyph {
 
     /// Whether this glyph is an emoji
     pub is_emoji: bool,
+
+    /// The size the glyph is drawn at, when it is not the line's.
+    pub font_size: Option<Pixels>,
 }
 
 /// Where the glyphs of a layout fall once it is wrapped, for a layout whose glyphs do not sit left
@@ -271,7 +272,6 @@ impl LineLayout {
                 left_runs.push(ShapedRun {
                     font_id: run.font_id,
                     glyphs: run.glyphs[..split_pos].to_vec(),
-                    font_size: run.font_size,
                 });
             }
 
@@ -283,12 +283,12 @@ impl LineLayout {
                         position: point(g.position.x - x_offset, g.position.y),
                         index: g.index - byte_index,
                         is_emoji: g.is_emoji,
+                        font_size: g.font_size,
                     })
                     .collect();
                 right_runs.push(ShapedRun {
                     font_id: run.font_id,
                     glyphs: right_glyphs,
-                    font_size: run.font_size,
                 });
             }
         }
@@ -1157,7 +1157,7 @@ pub struct FontRun {
     pub leading: LetterSpacing,
 }
 
-/// Draws each run at its share of the line's font size. Its glyphs grow or
+/// Draws each run's glyphs at the run's share of the line's font size. They grow or
 /// shrink from where the run starts, and the glyphs after it move by the width
 /// it gained or lost, so every text system gives the same result.
 fn apply_font_scale(layout: &mut LineLayout, runs: &[FontRun]) {
@@ -1176,32 +1176,14 @@ fn apply_font_scale(layout: &mut LineLayout, runs: &[FontRun]) {
             .map_or(1., |(_, scale)| *scale)
     };
     let font_size = layout.font_size;
-    let mut split = Vec::with_capacity(layout.runs.len());
-    for run in layout.runs.drain(..) {
-        for glyph in run.glyphs {
-            let scale = scale_at(glyph.index);
-            let size = (scale != 1.).then(|| font_size * scale);
-            match split.last_mut() {
-                Some(ShapedRun {
-                    font_id,
-                    glyphs,
-                    font_size,
-                }) if *font_id == run.font_id && *font_size == size => glyphs.push(glyph),
-                _ => split.push(ShapedRun {
-                    font_id: run.font_id,
-                    glyphs: vec![glyph],
-                    font_size: size,
-                }),
-            }
-        }
-    }
-    layout.runs = split;
     let mut glyphs: Vec<(f32, &mut ShapedGlyph)> = layout
         .runs
         .iter_mut()
-        .flat_map(|run| {
-            let scale = run.font_size.map_or(1., |size| size / font_size);
-            run.glyphs.iter_mut().map(move |glyph| (scale, glyph))
+        .flat_map(|run| run.glyphs.iter_mut())
+        .map(|glyph| {
+            let scale = scale_at(glyph.index);
+            glyph.font_size = (scale != 1.).then(|| font_size * scale);
+            (scale, glyph)
         })
         .collect();
     glyphs.sort_by(|a, b| f32::from(a.1.position.x).total_cmp(&f32::from(b.1.position.x)));
@@ -1517,6 +1499,7 @@ mod tests {
             position: point(px(x), px(0.)),
             index,
             is_emoji: false,
+            font_size: None,
         }
     }
 
@@ -1529,7 +1512,6 @@ mod tests {
             runs: vec![ShapedRun {
                 font_id: FontId(0),
                 glyphs,
-                font_size: None,
             }],
             len: 0,
         }

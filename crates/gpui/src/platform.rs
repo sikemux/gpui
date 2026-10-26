@@ -1697,6 +1697,7 @@ impl PlatformTextSystem for NoopTextSystem {
                     position: point(position, px(0.)),
                     index: ix,
                     is_emoji: glyph.0 == 2,
+                    font_size: None,
                 });
                 if glyph.0 == 2 {
                     position += em_width * 2.0;
@@ -1712,7 +1713,6 @@ impl PlatformTextSystem for NoopTextSystem {
             runs.push(ShapedRun {
                 font_id: FontId(0),
                 glyphs,
-                font_size: None,
             });
         } else {
             position = px(0.);

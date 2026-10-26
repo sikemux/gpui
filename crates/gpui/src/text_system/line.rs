@@ -326,9 +326,9 @@ impl<'a> ShapedLineCursor<'a> {
                             position: point(glyph.position.x - previous_x, glyph.position.y),
                             index: glyph.index - previous_index,
                             is_emoji: glyph.is_emoji,
+                            font_size: glyph.font_size,
                         })
                         .collect(),
-                    font_size: run.font_size,
                 });
             }
             if let Some(glyph) = run.glyphs.get(self.glyph_index) {
@@ -807,14 +807,14 @@ fn paint_line(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            run.font_size.unwrap_or(layout.font_size),
+                            glyph.font_size.unwrap_or(layout.font_size),
                         )?;
                     } else {
                         window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            run.font_size.unwrap_or(layout.font_size),
+                            glyph.font_size.unwrap_or(layout.font_size),
                             color,
                         )?;
                     }
@@ -1192,12 +1192,11 @@ fn paint_bidi_line(
                     continue;
                 }
                 let at = glyph_origin + baseline + point(px(0.), glyph.position.y);
+                let font_size = glyph.font_size.unwrap_or(layout.font_size);
                 match glyph.is_emoji {
                     true if tint.is_some() => {}
-                    true => window.paint_emoji(at, run.font_id, glyph.id, layout.font_size)?,
-                    false => {
-                        window.paint_glyph(at, run.font_id, glyph.id, layout.font_size, color)?
-                    }
+                    true => window.paint_emoji(at, run.font_id, glyph.id, font_size)?,
+                    false => window.paint_glyph(at, run.font_id, glyph.id, font_size, color)?,
                 }
             }
             if let Some((from, to, style)) = underline {
@@ -1353,6 +1352,7 @@ mod tests {
                 position: point(px(x), px(0.0)),
                 index,
                 is_emoji: false,
+                font_size: None,
             })
             .collect();
 
@@ -1365,7 +1365,6 @@ mod tests {
                 runs: vec![ShapedRun {
                     font_id: FontId(0),
                     glyphs: shaped_glyphs,
-                    font_size: None,
                 }],
                 len: text.len(),
             }),
@@ -1821,21 +1820,23 @@ mod tests {
                                 position: point(px(0.0), px(0.0)),
                                 index: 0,
                                 is_emoji: false,
+                                font_size: None,
                             },
                             ShapedGlyph {
                                 id: GlyphId(0),
                                 position: point(px(10.0), px(0.0)),
                                 index: 1,
                                 is_emoji: false,
+                                font_size: None,
                             },
                             ShapedGlyph {
                                 id: GlyphId(0),
                                 position: point(px(20.0), px(0.0)),
                                 index: 2,
                                 is_emoji: false,
+                                font_size: None,
                             },
                         ],
-                        font_size: None,
                     },
                     ShapedRun {
                         font_id: FontId(1),
@@ -1845,21 +1846,23 @@ mod tests {
                                 position: point(px(30.0), px(0.0)),
                                 index: 3,
                                 is_emoji: false,
+                                font_size: None,
                             },
                             ShapedGlyph {
                                 id: GlyphId(0),
                                 position: point(px(40.0), px(0.0)),
                                 index: 4,
                                 is_emoji: false,
+                                font_size: None,
                             },
                             ShapedGlyph {
                                 id: GlyphId(0),
                                 position: point(px(50.0), px(0.0)),
                                 index: 5,
                                 is_emoji: false,
+                                font_size: None,
                             },
                         ],
-                        font_size: None,
                     },
                 ],
                 len: 6,
@@ -2069,21 +2072,23 @@ mod tests {
                                 position: point(px(0.0), px(1.0)),
                                 index: 0,
                                 is_emoji: true,
+                                font_size: None,
                             },
                             ShapedGlyph {
                                 id: GlyphId(12),
                                 position: point(px(17.0), px(1.0)),
                                 index: 1,
                                 is_emoji: false,
+                                font_size: None,
                             },
                             ShapedGlyph {
                                 id: GlyphId(13),
                                 position: point(px(19.0), px(-1.0)),
                                 index: 1,
                                 is_emoji: false,
+                                font_size: None,
                             },
                         ],
-                        font_size: None,
                     },
                     ShapedRun {
                         font_id: FontId(8),
@@ -2093,15 +2098,16 @@ mod tests {
                                 position: point(px(25.0), px(1.0)),
                                 index: 5,
                                 is_emoji: true,
+                                font_size: None,
                             },
                             ShapedGlyph {
                                 id: GlyphId(22),
                                 position: point(px(41.0), px(1.0)),
                                 index: 7,
                                 is_emoji: false,
+                                font_size: None,
                             },
                         ],
-                        font_size: None,
                     },
                 ],
                 len: 10,
