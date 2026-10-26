@@ -950,6 +950,7 @@ impl CosmicTextSystemState {
                 position: point(glyph.x.into(), glyph.y.into()),
                 index: glyph.start,
                 is_emoji,
+                font_size: None,
             };
 
             if let Some(last_run) = runs
@@ -961,7 +962,6 @@ impl CosmicTextSystemState {
                 runs.push(ShapedRun {
                     font_id,
                     glyphs: vec![shaped_glyph],
-                    font_size: None,
                 });
             }
         }

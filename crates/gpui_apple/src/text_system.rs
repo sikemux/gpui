@@ -600,7 +600,6 @@ impl AppleTextSystemState {
                     runs.push(ShapedRun {
                         font_id,
                         glyphs: Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0)),
-                        font_size: None,
                     });
                     &mut runs.last_mut().unwrap().glyphs
                 }
@@ -622,6 +621,7 @@ impl AppleTextSystemState {
                     position: point(position.x as f32, position.y as f32).map(px),
                     index: ix_converter.utf8_ix,
                     is_emoji: self.is_emoji(font_id),
+                    font_size: None,
                 });
             }
         }

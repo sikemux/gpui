@@ -1636,6 +1636,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                     position: point(px(x), px(-glyph_offsets[this_glyph_idx].ascenderOffset)),
                     index: context.index_converter.utf8_ix,
                     is_emoji,
+                    font_size: None,
                 });
                 travelled += advance;
             }
@@ -1646,11 +1647,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             false => origin + extent,
         };
         context.width = context.width.max(right_edge);
-        context.runs.push(ShapedRun {
-            font_id,
-            glyphs,
-            font_size: None,
-        });
+        context.runs.push(ShapedRun { font_id, glyphs });
         Ok(())
     }
 
