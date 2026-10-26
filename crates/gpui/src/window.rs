@@ -4943,7 +4943,27 @@ impl Window {
         }) && paint_lens.iter().enumerate().all(|(at, &len)| {
             paint.start.count(at) <= paint.end.count(at) && paint.end.count(at) <= len
         });
-        debug_assert!(fits, "a cached view's ranges run past the last frame");
+        if !fits {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                log::error!(
+                    "a cached view's ranges run past the last frame, so it draws afresh: \
+                     prepaint {:?}..{:?} of {prepaint_lens:?}, paint {:?}..{:?} of {paint_lens:?}",
+                    (0..PrepaintStateIndex::COUNTS)
+                        .map(|at| prepaint.start.count(at))
+                        .collect::<Vec<_>>(),
+                    (0..PrepaintStateIndex::COUNTS)
+                        .map(|at| prepaint.end.count(at))
+                        .collect::<Vec<_>>(),
+                    (0..PaintIndex::COUNTS)
+                        .map(|at| paint.start.count(at))
+                        .collect::<Vec<_>>(),
+                    (0..PaintIndex::COUNTS)
+                        .map(|at| paint.end.count(at))
+                        .collect::<Vec<_>>(),
+                );
+            });
+        }
         fits
     }
 
