@@ -284,7 +284,8 @@ impl TextSystem {
     }
 
     /// Draws glyphs antialiased only, without the stem thickening the platform's font smoothing
-    /// adds to light text, as WebKit's `-webkit-font-smoothing: antialiased` does.
+    /// adds to light text, as WebKit's `-webkit-font-smoothing: antialiased` does. Screens below
+    /// 2x keep the platform's smoothing, as their glyphs are too few pixels to stay smooth thinner.
     pub fn set_antialiased_only(&self, antialiased_only: bool) {
         self.antialiased_only
             .store(antialiased_only, Ordering::Relaxed);
@@ -292,7 +293,7 @@ impl TextSystem {
 
     /// Thins light glyphs by raising their coverage to `exponent`, or by less as their color
     /// darkens, so light text on a dark ground draws as light as WebKit draws it. `None` turns
-    /// it off.
+    /// it off. Screens below 2x are left unthinned, as the curve strips their soft edges.
     pub fn set_light_text_curve(&self, exponent: Option<f32>) {
         self.light_text_curve
             .store(exponent.map_or(0, f32::to_bits), Ordering::Relaxed);
@@ -616,10 +617,10 @@ impl TextSystem {
     }
 
     /// How much to thin a glyph painted in the given color, from 2 for colors just lighter than
-    /// mid gray to 4 for white, or 0 for darker colors and for all while the curve is off.
-    pub(crate) fn glyph_thinning_for_color(&self, color: Hsla) -> u8 {
+    /// mid gray to 4 for white, or 0 for darker colors, below 2x and while the curve is off.
+    pub(crate) fn glyph_thinning_for_color(&self, color: Hsla, scale_factor: f32) -> u8 {
         let exponent = f32::from_bits(self.light_text_curve.load(Ordering::Relaxed));
-        if exponent <= 1. {
+        if exponent <= 1. || scale_factor < 2. {
             return 0;
         }
         let rgba: Rgba = color.into();
@@ -631,8 +632,8 @@ impl TextSystem {
     }
 
     /// Returns the dilation level to use for a glyph painted in the given color.
-    pub(crate) fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
-        if self.antialiased_only.load(Ordering::Relaxed) {
+    pub(crate) fn glyph_dilation_for_color(&self, color: Hsla, scale_factor: f32) -> u8 {
+        if self.antialiased_only.load(Ordering::Relaxed) && scale_factor >= 2. {
             return 0;
         }
         self.platform_text_system.glyph_dilation_for_color(color)
