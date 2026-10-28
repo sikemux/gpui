@@ -2,7 +2,7 @@ use crate::window::{ElementStateBox, Hole, Lost, paint_base, relocate};
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
     Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Size, Style,
+    LayoutId, PaintIndex, Pixels, Point, PrepaintStateIndex, Render, RenderOnce, Size, Style,
     StyleRefinement, TextStyle, WeakEntity,
 };
 use crate::{Empty, Window};
@@ -285,6 +285,7 @@ pub struct ViewElement<V: View> {
     handle: Option<AnyView>,
     isolated: bool,
     cached_style: Option<StyleRefinement>,
+    layout_id: Option<LayoutId>,
     #[cfg(feature = "profiler")]
     view_type_name: &'static str,
     #[cfg(debug_assertions)]
@@ -309,6 +310,7 @@ impl<V: View> ViewElement<V> {
             handle: None,
             isolated: false,
             cached_style: None,
+            layout_id: None,
             #[cfg(feature = "profiler")]
             view_type_name,
             view: Some(view),
@@ -470,6 +472,7 @@ impl<V: View> Element for ViewElement<V> {
                 cx,
                 &mut |window, cx| render_view(view.take().unwrap(), window, cx),
             );
+            self.layout_id = Some(layout.0);
             #[cfg(feature = "profiler")]
             window.window_profiler.end_view(
                 start,
@@ -501,6 +504,7 @@ impl<V: View> Element for ViewElement<V> {
             let prepainted = prepaint_view(
                 entity_id,
                 self.handle.take(),
+                self.layout_id,
                 global_id,
                 bounds,
                 element,
@@ -609,6 +613,7 @@ fn request_layout_component(
 fn prepaint_view(
     entity_id: EntityId,
     handle: Option<AnyView>,
+    layout_id: Option<LayoutId>,
     global_id: Option<&GlobalElementId>,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
@@ -623,7 +628,8 @@ fn prepaint_view(
     if let Some((handle, start)) = site
         && (carried || !window.next_frame.repaint_sites.contains_key(&entity_id))
     {
-        window.end_repaint_site(entity_id, handle, bounds, start);
+        let remainder = layout_id.map_or_else(Point::default, |id| window.snap_remainder(id));
+        window.end_repaint_site(entity_id, handle, bounds, remainder, start);
     }
     prepainted
 }

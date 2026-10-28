@@ -33,6 +33,8 @@ pub struct TaffyLayoutEngine {
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
+    /// Where a root laid out on its own begins, in device pixels, when not at zero.
+    root_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
 }
@@ -47,6 +49,7 @@ impl TaffyLayoutEngine {
             taffy,
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
+            root_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
         }
@@ -56,6 +59,7 @@ impl TaffyLayoutEngine {
         self.taffy.clear();
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
+        self.root_origins.clear();
         self.computed_layouts.clear();
     }
 
@@ -353,6 +357,18 @@ impl TaffyLayoutEngine {
     // snapped independently, but the raw content-box origin can carry a
     // 1dp residual into descendants.
 
+    /// How far the node's unrounded top-left lies from the device pixel it snapped to.
+    pub fn snap_remainder(&mut self, id: LayoutId, scale_factor: f32) -> Point<f32> {
+        self.layout_bounds(id, scale_factor);
+        self.absolute_outer_origins[&id].map(|at| at - round_half_toward_zero(at))
+    }
+
+    /// Lays out the root `id` as though it began at `origin`, in device pixels, so what it
+    /// holds snaps to the same pixels as when it was laid out among the rest of the window.
+    pub fn set_root_origin(&mut self, id: LayoutId, origin: Point<f32>) {
+        self.root_origins.insert(id, origin);
+    }
+
     pub fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
         if let Some(layout) = self.absolute_layout_bounds.get(&id).cloned() {
             return layout;
@@ -373,7 +389,10 @@ impl TaffyLayoutEngine {
                     .expect("parent absolute outer origin should be cached");
                 parent_origin + Point::from(layout_location)
             }
-            None => Point::from(layout_location),
+            None => {
+                self.root_origins.get(&id).copied().unwrap_or_default()
+                    + Point::from(layout_location)
+            }
         };
         self.absolute_outer_origins
             .insert(id, absolute_outer_origin);
