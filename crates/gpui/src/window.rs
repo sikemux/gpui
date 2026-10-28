@@ -1122,6 +1122,9 @@ pub(crate) struct RepaintSite {
     pub(crate) prepaint_range: Range<PrepaintStateIndex>,
     pub(crate) paint_range: Range<PaintIndex>,
     pub(crate) bounds: Bounds<Pixels>,
+    /// How far the view's unrounded top-left lay from `bounds.origin`, in device pixels, so
+    /// drawing it again alone snaps its contents where the whole window snapped them.
+    pub(crate) snap_remainder: Point<f32>,
     pub(crate) parent_node: Option<DispatchNodeId>,
     pub(crate) element_id_stack: ElementIdStack,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
@@ -4091,6 +4094,12 @@ impl Window {
                     cx.detect_accessed_entities(|cx| {
                         let mut element =
                             crate::View::render(site.view.clone(), window, cx).into_any_element();
+                        let root = element.request_layout(window, cx);
+                        window
+                            .layout_engine
+                            .as_mut()
+                            .unwrap()
+                            .set_root_origin(root, site.snap_remainder);
                         let room = element.layout_as_root(
                             size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
                             window,
@@ -5024,6 +5033,7 @@ impl Window {
         entity: EntityId,
         view: AnyView,
         bounds: Bounds<Pixels>,
+        snap_remainder: Point<f32>,
         (start, parent_node): (PrepaintStateIndex, Option<DispatchNodeId>),
     ) {
         let site = RepaintSite {
@@ -5031,6 +5041,7 @@ impl Window {
             prepaint_range: start..self.prepaint_index(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
             bounds,
+            snap_remainder,
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
@@ -6619,6 +6630,15 @@ impl Window {
     /// GPUI itself automatically in order to pass your element its `Bounds` automatically.
     ///
     /// This method should only be called as part of element drawing.
+    /// How far the laid out node's unrounded top-left lies from the device pixel it snapped to.
+    pub(crate) fn snap_remainder(&mut self, layout_id: LayoutId) -> Point<f32> {
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .snap_remainder(layout_id, scale_factor)
+    }
+
     pub fn layout_bounds(&mut self, layout_id: LayoutId) -> Bounds<Pixels> {
         self.invalidator.debug_assert_prepaint();
 
@@ -11985,5 +12005,62 @@ mod repaint_tests {
             let shown = if lit { "lit" } else { "dim" };
             assert!(cx.debug_bounds(shown).is_some(), "the lamp shows {shown}");
         }
+    }
+
+    struct Centered {
+        typed: usize,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Centered {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().w(px(20.5)).h(px(20.)).flex().justify_center().child(
+                div()
+                    .w(px(20.))
+                    .h(px(20.))
+                    .debug_selector(|| "centered".into())
+                    .child(self.typed.to_string()),
+            )
+        }
+    }
+
+    struct Frame {
+        centered: crate::Entity<Centered>,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Frame {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .w(px(21.))
+                .flex()
+                .justify_center()
+                .child(self.centered.clone().into_element().isolated())
+        }
+    }
+
+    #[gpui::test]
+    fn test_an_isolated_view_on_a_half_pixel_draws_again_where_it_was(cx: &mut TestAppContext) {
+        let renders = Rc::new(Cell::new(0));
+        let (frame, cx) = cx.add_window_view(|_, cx| Frame {
+            centered: cx.new(|_| Centered {
+                typed: 0,
+                renders: Rc::default(),
+            }),
+            renders: renders.clone(),
+        });
+        cx.run_until_parked();
+        let before = cx.debug_bounds("centered").unwrap();
+        let frame_renders = renders.get();
+        let centered = frame.read_with(cx, |frame, _| frame.centered.clone());
+        centered.update(cx, |centered, cx| {
+            centered.typed += 1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(renders.get(), frame_renders, "only the view drew again");
+        assert_eq!(cx.debug_bounds("centered").unwrap(), before);
     }
 }
