@@ -32,30 +32,30 @@ publish = false
 edition = "2024"
 
 [workspace.dependencies]
-bench_metrics = { path = "crates/bench_metrics" }
-collections = { path = "crates/collections", version = "0.1.0" }
-derive_refineable = { path = "crates/refineable/derive_refineable" }
-gpui = { path = "crates/gpui", default-features = false }
-gpui_apple = { path = "crates/gpui_apple" }
-gpui_linux = { path = "crates/gpui_linux", default-features = false }
-gpui_macos = { path = "crates/gpui_macos", default-features = false }
-gpui_macros = { path = "crates/gpui_macros" }
-gpui_platform = { path = "crates/gpui_platform", default-features = false }
-gpui_shared_string = { path = "crates/gpui_shared_string" }
-gpui_util = { path = "crates/gpui_util" }
-gpui_wgpu = { path = "crates/gpui_wgpu" }
-gpui_windows = { path = "crates/gpui_windows", default-features = false }
-http_client = { path = "crates/http_client" }
-path = { path = "crates/path" }
-perf = { path = "tooling/perf", default-features = false }
-refineable = { path = "crates/refineable" }
-scheduler = { path = "crates/scheduler" }
-sum_tree = { path = "crates/sum_tree" }
-util = { path = "crates/util" }
-util_macros = { path = "crates/util_macros" }
-zlog = { path = "crates/zlog" }
-ztracing = { path = "crates/ztracing" }
-ztracing_macro = { path = "crates/ztracing_macro" }
+bench_metrics = { package = "gpui-pre-bench-metrics", path = "crates/bench_metrics" }
+collections = { package = "gpui-pre-collections", path = "crates/collections" }
+derive_refineable = { package = "gpui-pre-derive-refineable", path = "crates/refineable/derive_refineable" }
+gpui = { package = "gpui-pre", path = "crates/gpui", default-features = false }
+gpui_apple = { package = "gpui-pre-apple", path = "crates/gpui_apple" }
+gpui_linux = { package = "gpui-pre-linux", path = "crates/gpui_linux", default-features = false }
+gpui_macos = { package = "gpui-pre-macos", path = "crates/gpui_macos", default-features = false }
+gpui_macros = { package = "gpui-pre-macros", path = "crates/gpui_macros" }
+gpui_platform = { package = "gpui-pre-platform", path = "crates/gpui_platform", default-features = false }
+gpui_shared_string = { package = "gpui-pre-shared-string", path = "crates/gpui_shared_string" }
+gpui_util = { package = "gpui-pre-util", path = "crates/gpui_util" }
+gpui_wgpu = { package = "gpui-pre-wgpu", path = "crates/gpui_wgpu" }
+gpui_windows = { package = "gpui-pre-windows", path = "crates/gpui_windows", default-features = false }
+http_client = { package = "gpui-pre-http-client", path = "crates/http_client" }
+path = { package = "gpui-pre-path", path = "crates/path" }
+perf = { package = "gpui-pre-perf", path = "tooling/perf", default-features = false }
+refineable = { package = "gpui-pre-refineable", path = "crates/refineable" }
+scheduler = { package = "gpui-pre-scheduler", path = "crates/scheduler" }
+sum_tree = { package = "gpui-pre-sum-tree", path = "crates/sum_tree" }
+util = { package = "gpui-pre-zed-util", path = "crates/util" }
+util_macros = { package = "gpui-pre-util-macros", path = "crates/util_macros" }
+zlog = { package = "gpui-pre-zlog", path = "crates/zlog" }
+ztracing = { package = "gpui-pre-ztracing", path = "crates/ztracing" }
+ztracing_macro = { package = "gpui-pre-ztracing-macro", path = "crates/ztracing_macro" }
 
 #
 # External crates
