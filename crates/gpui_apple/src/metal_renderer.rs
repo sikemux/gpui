@@ -4,9 +4,9 @@ use block2::RcBlock;
 use collections::FxHashMap;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, DevicePixels, GAUSSIAN_REACH,
-    Hsla, KAWASE_LEVELS, Kawase, LayerEffect, PaintRawShader, PaintSurface, Path, Point,
-    PrimitiveBatch, RawShaderProgram, ScaledPixels, Scene, ShaderId, Size, point, size,
+    AtlasTextureId, Background, BlurPasses, Bounds, ContentMask, Corners, DevicePixels,
+    GAUSSIAN_REACH, Hsla, KAWASE_LEVELS, Kawase, LayerEffect, PaintRawShader, PaintSurface, Path,
+    Point, PrimitiveBatch, RawShaderProgram, ScaledPixels, Scene, ShaderId, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -2261,6 +2261,11 @@ impl MetalRenderer {
             Some(&instance_bindings.surfaces.buffer),
             instance_bindings.surfaces.offset as u64,
         );
+        command_encoder.set_fragment_buffer(
+            SurfaceInputIndex::Surfaces as u64,
+            Some(&instance_bindings.surfaces.buffer),
+            instance_bindings.surfaces.offset as u64,
+        );
         command_encoder.set_vertex_bytes(
             SurfaceInputIndex::ViewportSize as u64,
             mem::size_of_val(&viewport_size) as u64,
@@ -2922,6 +2927,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            corner_radii: surface.corner_radii,
         }))?,
         raw_shaders: writer.write_iter(scene.raw_shaders.iter().map(PaintRawShader::instance))?,
     })
@@ -3115,6 +3121,7 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -3208,6 +3215,7 @@ mod tests {
             order: 0,
             bounds,
             content_mask: ContentMask { bounds },
+            corner_radii: Corners::default(),
             image_buffer: image_buffer.clone(),
         });
         drop(image_buffer);

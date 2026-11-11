@@ -6407,6 +6407,7 @@ impl Window {
     pub fn paint_surface(
         &mut self,
         bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
         image_buffer: CFRetained<CVPixelBuffer>,
     ) {
         use crate::PaintSurface;
@@ -6419,6 +6420,7 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
+            corner_radii: corner_radii.scale(self.scale_factor()),
             image_buffer,
         });
     }
