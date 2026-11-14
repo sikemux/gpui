@@ -2622,7 +2622,13 @@ impl Interactivity {
                                                     window.set_window_cursor_style(mouse_cursor);
                                                 }
                                             } else {
-                                                if let Some(mouse_cursor) = style.mouse_cursor {
+                                                let mouse_cursor =
+                                                    style.mouse_cursor.or_else(|| {
+                                                        (!self.click_listeners.is_empty())
+                                                            .then_some(cx.click_cursor)
+                                                            .flatten()
+                                                    });
+                                                if let Some(mouse_cursor) = mouse_cursor {
                                                     window.set_cursor_style(mouse_cursor, hitbox);
                                                 }
                                             }

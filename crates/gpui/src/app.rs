@@ -936,6 +936,7 @@ pub struct App {
     pub(crate) window_update_stack: Vec<WindowId>,
     pub(crate) mode: GpuiMode,
     pub(crate) cursor_hide_mode: CursorHideMode,
+    pub(crate) click_cursor: Option<CursorStyle>,
     pub(crate) reduce_motion: bool,
     /// Origin of the shared clock that phase-locks synced repeating animations.
     pub(crate) synced_animation_epoch: Instant,
@@ -1047,6 +1048,7 @@ impl App {
                 quit_mode: QuitMode::default(),
                 quitting: false,
                 cursor_hide_mode: CursorHideMode::default(),
+                click_cursor: None,
                 reduce_motion: false,
                 synced_animation_epoch,
                 accessibility_force_disabled: false,
@@ -1344,6 +1346,17 @@ impl App {
     /// to keyboard input.
     pub fn set_cursor_hide_mode(&mut self, mode: CursorHideMode) {
         self.cursor_hide_mode = mode;
+    }
+
+    /// The cursor shown over an element that has a click listener and sets no cursor of its own.
+    pub fn click_cursor(&self) -> Option<CursorStyle> {
+        self.click_cursor
+    }
+
+    /// Sets the cursor shown over every element that has a click listener and sets no cursor
+    /// of its own, such as `CursorStyle::PointingHand`. `None`, the default, leaves the arrow.
+    pub fn set_click_cursor(&mut self, cursor: Option<CursorStyle>) {
+        self.click_cursor = cursor;
     }
 
     /// Returns whether the cursor is currently visible according to the
