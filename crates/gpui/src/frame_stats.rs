@@ -10,6 +10,9 @@
 //! whole frame request, `draw` covers render, prepaint, layout, paint and finish, and `present`
 //! covers acquire, encode and queue_present. `layout` is taffy's `compute_layout`, which runs
 //! inside prepaint, so the recorded prepaint excludes it.
+//!
+//! The summary also counts the window's ground layer drawn on its own, with the GPU time of
+//! each of those passes, read when the GPU finishes them.
 
 use std::{
     fmt::Write as _,
@@ -118,6 +121,8 @@ struct Second {
     drawn_ticks: Vec<u32>,
     gaps: Vec<u32>,
     phase_sums: [Duration; PHASES],
+    ground_draws: u32,
+    ground_gpu: Vec<u32>,
 }
 
 impl Second {
@@ -131,6 +136,8 @@ impl Second {
             drawn_ticks: Vec::with_capacity(256),
             gaps: Vec::with_capacity(256),
             phase_sums: [Duration::ZERO; PHASES],
+            ground_draws: 0,
+            ground_gpu: Vec::with_capacity(256),
         }
     }
 }
@@ -223,6 +230,32 @@ pub fn mark_presented() {
     }
 }
 
+/// Counts one pass over the window's ground layer.
+#[inline]
+pub fn mark_ground_drawn() {
+    if let Some(recorder) = recorder() {
+        recorder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .second
+            .ground_draws += 1;
+    }
+}
+
+/// Adds the GPU time of one ground pass. The GPU reports it on its own thread once the pass
+/// is done, so it lands in whichever second is open then.
+#[inline]
+pub fn record_ground_gpu(gpu: Duration) {
+    if let Some(recorder) = recorder() {
+        recorder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .second
+            .ground_gpu
+            .push(gpu.as_micros() as u32);
+    }
+}
+
 #[inline]
 fn recorder() -> Option<&'static Mutex<Recorder>> {
     RECORDER.as_ref()
@@ -288,8 +321,10 @@ impl Recorder {
         let span = (now - second.start).as_secs_f64();
         let mut ticks = second.drawn_ticks;
         let mut gaps = second.gaps;
+        let mut ground_gpu = second.ground_gpu;
         ticks.sort_unstable();
         gaps.sort_unstable();
+        ground_gpu.sort_unstable();
         let ms = |v: u32| v as f64 / 1000.0;
         let drawn = second.drawn.max(1) as f64;
         let mean = |phase: Phase| second.phase_sums[phase as usize].as_secs_f64() * 1000.0 / drawn;
@@ -299,7 +334,8 @@ impl Recorder {
             "S {:.1} ticks {} native {} drawn {} presented {} fps {:.1} \
              tick_ms p50 {:.2} p95 {:.2} p99 {:.2} max {:.2} gap_ms p50 {:.2} p95 {:.2} max {:.2} \
              per_drawn_ms tick {:.2} cb {:.2} render {:.2} layout {:.2} prepaint {:.2} paint {:.2} \
-             present {:.2} acquire {:.2} encode {:.2} queue_present {:.2}",
+             present {:.2} acquire {:.2} encode {:.2} queue_present {:.2} \
+             ground_draws {} ground_gpu_ms p50 {:.3} p95 {:.3} max {:.3}",
             (now - self.epoch).as_secs_f64(),
             second.ticks,
             second.native,
@@ -323,6 +359,10 @@ impl Recorder {
             mean(Phase::Acquire),
             mean(Phase::Encode),
             mean(Phase::QueuePresent),
+            second.ground_draws,
+            ms(percentile(&ground_gpu, 50)),
+            ms(percentile(&ground_gpu, 95)),
+            ms(ground_gpu.last().copied().unwrap_or(0)),
         );
         let _ = writeln!(self.out, "{line}");
         let _ = self.out.flush();

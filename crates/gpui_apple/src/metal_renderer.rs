@@ -745,9 +745,22 @@ impl MetalRenderer {
         let used = writer.offset;
         let instance_buffer = Cell::new(Some(writer.finish()));
         instance_buffer_pool.lock().settle(used);
-        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
+        let timed = gpui::frame_stats::enabled();
+        let block = RcBlock::new(move |command_buffer: ptr::NonNull<AnyObject>| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
+            }
+            if timed {
+                // SAFETY: Metal hands the completed handler the command buffer it finished.
+                let (start, end): (f64, f64) = unsafe {
+                    (
+                        objc2::msg_send![command_buffer.as_ptr(), GPUStartTime],
+                        objc2::msg_send![command_buffer.as_ptr(), GPUEndTime],
+                    )
+                };
+                gpui::frame_stats::record_ground_gpu(Duration::from_secs_f64(
+                    (end - start).max(0.),
+                ));
             }
         });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
@@ -756,6 +769,7 @@ impl MetalRenderer {
         }
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+        gpui::frame_stats::mark_ground_drawn();
         gpui::frame_stats::mark_presented();
     }
 
