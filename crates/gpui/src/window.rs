@@ -6978,14 +6978,17 @@ impl Window {
         subscription
     }
 
+    /// The cursor the window shows for the pointer's last position, as of the last frame drawn.
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.rendered_frame
+            .cursor_style(self)
+            .unwrap_or(CursorStyle::Arrow)
+    }
+
     fn reset_cursor_style(&self, cx: &mut App) {
         // Set the cursor only if we're the active window.
         if self.is_window_hovered() {
-            let style = self
-                .rendered_frame
-                .cursor_style(self)
-                .unwrap_or(CursorStyle::Arrow);
-            cx.platform.set_cursor_style(style);
+            cx.platform.set_cursor_style(self.cursor_style());
         }
     }
 
