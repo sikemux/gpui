@@ -1117,8 +1117,7 @@ impl MacWindowState {
             self.ground_size = Some(size);
         }
         renderer.update_transparency(!opaque);
-        renderer.draw_ground(ground, &scene.ground_shaders, 1. / scale);
-        if !unchanged {
+        if renderer.draw_ground(ground, &scene.ground_shaders, 1. / scale) && !unchanged {
             self.drawn_ground = Some(DrawnGround {
                 color: ground,
                 shaders: scene.ground_shaders.clone(),

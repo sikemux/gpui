@@ -672,9 +672,10 @@ impl MetalRenderer {
 
     /// Fills the layer with `color` and draws `shaders` over it, their bounds scaled by
     /// `scale` from the window's device pixels to the layer's.
-    pub fn draw_ground(&mut self, color: Hsla, shaders: &[PaintRawShader], scale: f32) {
+    /// Whether it drew: it skips the pass when it has no layer, no drawable or no room for the shaders.
+    pub fn draw_ground(&mut self, color: Hsla, shaders: &[PaintRawShader], scale: f32) -> bool {
         let Some(layer) = self.layer.clone() else {
-            return;
+            return false;
         };
         let drawable_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
@@ -683,7 +684,7 @@ impl MetalRenderer {
         );
         let Some(drawable) = layer.next_drawable() else {
             log::error!("failed to retrieve the ground's next drawable");
-            return;
+            return false;
         };
         let mut writer = InstanceBufferWriter::new(
             &self.device,
@@ -703,7 +704,7 @@ impl MetalRenderer {
             Ok(instances) => instances,
             Err(error) => {
                 log::error!("the ground's shaders do not fit: {error:#}");
-                return;
+                return false;
             }
         };
         let rgba = color.to_rgb();
@@ -771,6 +772,7 @@ impl MetalRenderer {
         command_buffer.commit();
         gpui::frame_stats::mark_ground_drawn();
         gpui::frame_stats::mark_presented();
+        true
     }
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
