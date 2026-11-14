@@ -4315,13 +4315,15 @@ impl Window {
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         let frame_stats_present = crate::frame_stats::start();
+        if self.needs_ground_present.replace(false) {
+            self.platform_window.draw_ground(&self.rendered_frame.scene);
+        }
         self.platform_window.draw_layered(
             &self.rendered_frame.scene,
             self.rendered_frame.overlay_scene_start,
             &self.rendered_frame.overlay_input,
         );
         crate::frame_stats::record(crate::frame_stats::Phase::Present, frame_stats_present);
-        self.needs_ground_present.set(false);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -6484,6 +6486,9 @@ impl Window {
     /// laying out or painting any view; see [`RawShaderProgram`](crate::RawShaderProgram).
     pub fn present_shaders(&self) {
         self.needs_present.set(true);
+        if self.ground_layer {
+            self.needs_ground_present.set(true);
+        }
         self.platform_window.schedule_frame();
         self.invalidator.wake_platform();
     }

@@ -744,6 +744,8 @@ struct MacWindowState {
     ground_renderer: Option<renderer::Renderer>,
     ground_view: Option<NonNull<AnyObject>>,
     ground_size: Option<Size<Pixels>>,
+    /// What the ground layer shows now, so a frame that changes none of it leaves it as it is.
+    drawn_ground: Option<DrawnGround>,
     /// Whether anything asked for a frame since the last display tick.
     frame_wanted: bool,
     /// Display ticks in a row that nothing asked for.
@@ -794,6 +796,27 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<*mut AnyObject>,
+}
+
+struct DrawnGround {
+    color: gpui::Hsla,
+    shaders: Vec<gpui::PaintRawShader>,
+    size: Size<Pixels>,
+    scale: f32,
+    opaque: bool,
+}
+
+/// Whether two frames paint the same shaders on their ground, whatever else each frame drew
+/// before them.
+fn same_shaders(a: &[gpui::PaintRawShader], b: &[gpui::PaintRawShader]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            std::ptr::eq(a.program, b.program)
+                && a.bounds == b.bounds
+                && a.content_mask == b.content_mask
+                && a.params == b.params
+                && a.image == b.image
+        })
 }
 
 impl MacWindowState {
@@ -1053,8 +1076,9 @@ impl MacWindowState {
     }
 
     /// Draws the scene's ground into the layer behind the drawing, one pixel per point, or
-    /// hides that layer when the scene has no ground.
-    fn draw_ground(&mut self, scene: &gpui::Scene) {
+    /// hides that layer when the scene has no ground. Unless `moved_on`, which asks for the
+    /// shaders' clock to move on, the layer is drawn only when what it shows has changed.
+    fn draw_ground(&mut self, scene: &gpui::Scene, moved_on: bool) {
         let Some(ground) = scene.ground else {
             if let Some(view) = self.ground_view.take() {
                 unsafe {
@@ -1062,6 +1086,7 @@ impl MacWindowState {
                 }
                 self.ground_renderer = None;
                 self.ground_size = None;
+                self.drawn_ground = None;
                 let opaque = self.background_appearance == WindowBackgroundAppearance::Opaque;
                 self.renderer.update_transparency(!opaque);
             }
@@ -1074,6 +1099,16 @@ impl MacWindowState {
         let scale = self.scale_factor();
         let opaque =
             self.background_appearance == WindowBackgroundAppearance::Opaque && ground.a >= 1.;
+        let unchanged = self.drawn_ground.as_ref().is_some_and(|drawn| {
+            drawn.color == ground
+                && drawn.size == size
+                && drawn.scale == scale
+                && drawn.opaque == opaque
+                && same_shaders(&drawn.shaders, &scene.ground_shaders)
+        });
+        if unchanged && !moved_on {
+            return;
+        }
         let Some(renderer) = self.ground_renderer.as_mut() else {
             return;
         };
@@ -1083,6 +1118,15 @@ impl MacWindowState {
         }
         renderer.update_transparency(!opaque);
         renderer.draw_ground(ground, &scene.ground_shaders, 1. / scale);
+        if !unchanged {
+            self.drawn_ground = Some(DrawnGround {
+                color: ground,
+                shaders: scene.ground_shaders.clone(),
+                size,
+                scale,
+                opaque,
+            });
+        }
     }
 
     fn add_ground_layer(&mut self) {
@@ -1114,6 +1158,7 @@ impl MacWindowState {
             self.ground_view = NonNull::new(view);
         }
         self.ground_renderer = Some(renderer);
+        self.drawn_ground = None;
         self.renderer.update_transparency(true);
     }
 
@@ -1288,6 +1333,7 @@ impl MacWindow {
                 ground_renderer: None,
                 ground_view: None,
                 ground_size: None,
+                drawn_ground: None,
                 frame_wanted: false,
                 idle_ticks: 0,
                 request_frame_callback: None,
@@ -2317,7 +2363,7 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
-        this.draw_ground(scene);
+        this.draw_ground(scene, false);
         this.renderer.draw(scene);
     }
 
@@ -2335,7 +2381,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn draw_ground(&self, scene: &gpui::Scene) {
-        self.0.lock().draw_ground(scene);
+        self.0.lock().draw_ground(scene, true);
     }
 
     fn draw_layered(
@@ -2345,7 +2391,7 @@ impl PlatformWindow for MacWindow {
         overlay_input: &[Bounds<Pixels>],
     ) {
         let mut state = self.0.lock();
-        state.draw_ground(scene);
+        state.draw_ground(scene, false);
         if state.overlay_renderer.is_none() {
             state.renderer.draw(scene);
             return;
