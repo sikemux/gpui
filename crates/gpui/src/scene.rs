@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, ShaderId, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, HitboxId, Hsla,
+    Pixels, Point, Radians, ScaledPixels, ShaderId, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -14,6 +14,8 @@ use std::{
     ops::{Add, Range, Sub},
     slice,
 };
+
+use smallvec::SmallVec;
 
 #[allow(non_camel_case_types, unused)]
 #[expect(missing_docs)]
@@ -86,9 +88,14 @@ impl Scene {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.paint_operations
-            .iter()
-            .all(|op| matches!(op, PaintOperation::StartLayer(_) | PaintOperation::EndLayer))
+        self.paint_operations.iter().all(|op| {
+            matches!(
+                op,
+                PaintOperation::StartLayer(_)
+                    | PaintOperation::EndLayer
+                    | PaintOperation::NativeView(_)
+            )
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -114,6 +121,106 @@ impl Scene {
                 }
                 _ => None,
             })
+    }
+
+    pub(crate) fn mark_native_view(&mut self, mark: NativeViewMark) {
+        self.paint_operations.push(PaintOperation::NativeView(mark));
+    }
+
+    /// Each native view painted, with where it falls in paint order.
+    pub(crate) fn native_views(&self) -> impl Iterator<Item = (usize, NativeViewMark)> + '_ {
+        self.paint_operations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, operation)| match operation {
+                PaintOperation::NativeView(mark) => Some((index, *mark)),
+                _ => None,
+            })
+    }
+
+    /// The runs of paint operations that must show above a native view, each with where it
+    /// draws. A primitive is lifted when it overlaps a native view painted before it, or a run
+    /// already lifted, so it stays above what it was painted over; one that a native view
+    /// painted after it overlaps stays beneath, under that view.
+    pub(crate) fn lifted_over_native_views(
+        &self,
+    ) -> (Vec<Range<usize>>, Vec<Bounds<ScaledPixels>>) {
+        let natives: SmallVec<[Bounds<ScaledPixels>; 4]> =
+            self.native_views().map(|(_, mark)| mark.bounds).collect();
+        let (mut runs, mut drawn_by_run) = (Vec::new(), Vec::<Bounds<ScaledPixels>>::new());
+        let Some((first, _)) = self.native_views().next() else {
+            return (runs, drawn_by_run);
+        };
+        let (mut painted, mut open) = (0, false);
+        for (index, operation) in self.paint_operations.iter().enumerate().skip(first) {
+            let primitive = match operation {
+                PaintOperation::NativeView(_) => {
+                    painted += 1;
+                    continue;
+                }
+                PaintOperation::Primitive(primitive) => primitive,
+                _ => continue,
+            };
+            let drawn = primitive
+                .bounds()
+                .intersect(&primitive.content_mask().bounds);
+            let (before, after) = natives.split_at(painted);
+            let over = before.iter().any(|native| native.intersects(&drawn))
+                || drawn_by_run.iter().any(|run| run.intersects(&drawn));
+            let under = after.iter().any(|native| native.intersects(&drawn));
+            if !over || under {
+                open = false;
+                continue;
+            }
+            match (open, runs.last_mut(), drawn_by_run.last_mut()) {
+                (true, Some(run), Some(run_drawn)) => {
+                    *run = run.start..index + 1;
+                    *run_drawn = run_drawn.union(&drawn);
+                }
+                _ => {
+                    runs.push(index..index + 1);
+                    drawn_by_run.push(drawn);
+                }
+            }
+            open = true;
+        }
+        (runs, drawn_by_run)
+    }
+
+    /// This scene as what is drawn beneath native views and what `lifted` puts above them.
+    pub fn split(&self, lifted: &[Range<usize>]) -> (Scene, Scene) {
+        let (mut beneath, mut above) = (Scene::default(), Scene::default());
+        let mut runs = lifted.iter().peekable();
+        for (index, operation) in self.paint_operations.iter().enumerate() {
+            while runs.next_if(|run| run.end <= index).is_some() {}
+            let is_lifted = runs.peek().is_some_and(|run| run.contains(&index));
+            match operation {
+                PaintOperation::Primitive(primitive) if is_lifted => {
+                    above.insert_primitive(primitive.clone())
+                }
+                PaintOperation::Primitive(primitive) => beneath.insert_primitive(primitive.clone()),
+                PaintOperation::NativeView(mark) => beneath.mark_native_view(*mark),
+                PaintOperation::StartLayer(bounds) => {
+                    beneath.push_layer(*bounds);
+                    above.push_layer(*bounds);
+                }
+                PaintOperation::EndLayer => {
+                    beneath.pop_layer();
+                    above.pop_layer();
+                }
+                PaintOperation::StartFilter(bounds, transform_origin, content_mask, filter) => {
+                    beneath.push_filter(*bounds, *transform_origin, *content_mask, *filter);
+                    above.push_filter(*bounds, *transform_origin, *content_mask, *filter);
+                }
+                PaintOperation::EndFilter => {
+                    beneath.pop_filter();
+                    above.pop_filter();
+                }
+            }
+        }
+        beneath.finish();
+        above.finish();
+        (beneath, above)
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
@@ -300,6 +407,7 @@ impl Scene {
                     self.push_filter(*bounds, *transform_origin, *content_mask, *filter)
                 }
                 PaintOperation::EndFilter => self.pop_filter(),
+                PaintOperation::NativeView(mark) => self.mark_native_view(*mark),
             }
         }
     }
@@ -408,6 +516,15 @@ pub(crate) enum PaintOperation {
         Filter,
     ),
     EndFilter,
+    /// Where a native view sits in paint order: what is painted after it is drawn above it.
+    NativeView(NativeViewMark),
+}
+
+/// A native view shown over `bounds`, which takes the pointer through `hitbox`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeViewMark {
+    pub(crate) bounds: Bounds<ScaledPixels>,
+    pub(crate) hitbox: HitboxId,
 }
 
 /// A run of primitives that is drawn offscreen, put through [`Effect`], and composited back.

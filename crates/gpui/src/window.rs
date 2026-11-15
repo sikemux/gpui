@@ -31,6 +31,7 @@ use crate::interactive::TouchEvent;
 
 /// A gaussian is cut off after three standard deviations.
 const BLUR_REACH: f32 = 3.;
+use crate::scene::NativeViewMark;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
@@ -1087,7 +1088,7 @@ pub(crate) struct Frame {
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
-    overlay_scene_start: usize,
+    lifted: Vec<Range<usize>>,
     overlay_input: Vec<Bounds<Pixels>>,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
@@ -1348,6 +1349,52 @@ pub(crate) struct PaintIndex {
 }
 
 impl Frame {
+    /// Lifts what draws over a native view painted before it onto the plane above native
+    /// views, so it shows over them as it would over anything GPUI drew before it. The plane
+    /// takes the pointer where `pointer` says, or else where what it lifted has hitboxes, but
+    /// for those from `passive_hitboxes` on, which are a tooltip's and leave the pointer be.
+    fn lift_over_native_views(
+        &mut self,
+        pointer: Option<Bounds<Pixels>>,
+        passive_hitboxes: Option<usize>,
+        scale_factor: f32,
+    ) {
+        let (lifted, drawn) = self.scene.lifted_over_native_views();
+        self.lifted = lifted;
+        self.overlay_input.clear();
+        if self.lifted.is_empty() {
+            return;
+        }
+        if let Some(whole) = pointer {
+            self.overlay_input.push(whole);
+            return;
+        }
+        let first = self
+            .scene
+            .native_views()
+            .filter_map(|(_, native)| {
+                self.hitboxes
+                    .iter()
+                    .position(|hitbox| hitbox.id == native.hitbox)
+            })
+            .min()
+            .map_or(0, |index| index + 1);
+        let last = passive_hitboxes.unwrap_or(self.hitboxes.len()).max(first);
+        let drawn: SmallVec<[Bounds<Pixels>; 4]> = drawn
+            .iter()
+            .map(|bounds| bounds.map(|value| Pixels(value.0 / scale_factor)))
+            .collect();
+        for hitbox in &self.hitboxes[first..last] {
+            let hit = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+            self.overlay_input.extend(
+                drawn
+                    .iter()
+                    .map(|drawn| drawn.intersect(&hit))
+                    .filter(|piece| !piece.is_empty()),
+            );
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_debug_bounds(&mut self, selector: String, bounds: Bounds<Pixels>) {
         self.debug_bounds.insert(selector.clone(), bounds);
@@ -1363,7 +1410,7 @@ impl Frame {
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
-            overlay_scene_start: 0,
+            lifted: Vec::new(),
             overlay_input: Vec::new(),
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
@@ -1396,7 +1443,7 @@ impl Frame {
         self.mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
-        self.overlay_scene_start = 0;
+        self.lifted.clear();
         self.overlay_input.clear();
         self.input_handlers.clear();
         self.tooltip_requests.clear();
@@ -4303,7 +4350,8 @@ impl Window {
         self.redraw_everything |= !kept;
     }
 
-    /// Lets native child views sit between the root's drawing and deferred draws.
+    /// Lets native child views sit in paint order: what draws over one after it is painted
+    /// shows above it, on a plane of its own. See [`Window::paint_native_view`].
     pub fn enable_scene_overlay(&self) -> anyhow::Result<()> {
         self.platform_window.enable_scene_overlay()
     }
@@ -4317,7 +4365,7 @@ impl Window {
         let frame_stats_present = crate::frame_stats::start();
         self.platform_window.draw_layered(
             &self.rendered_frame.scene,
-            self.rendered_frame.overlay_scene_start,
+            &self.rendered_frame.lifted,
             &self.rendered_frame.overlay_input,
         );
         crate::frame_stats::record(crate::frame_stats::Phase::Present, frame_stats_present);
@@ -4540,7 +4588,6 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
-        let overlay_hitboxes = self.next_frame.hitboxes.len();
         self.prepaint_deferred_draws(cx);
         let mut overlay_hitboxes_end = None;
 
@@ -4568,17 +4615,7 @@ impl Window {
             overlay_hitboxes_end = Some(self.next_frame.hitboxes.len());
             tooltip_element = self.prepaint_tooltip(cx);
         }
-        self.next_frame.overlay_input = if prompt_element.is_some() || active_drag_element.is_some()
-        {
-            vec![Bounds::new(Point::default(), root_size)]
-        } else {
-            let end = overlay_hitboxes_end.unwrap_or(self.next_frame.hitboxes.len());
-            self.next_frame.hitboxes[overlay_hitboxes..end]
-                .iter()
-                .map(|hitbox| hitbox.bounds.intersect(&hitbox.content_mask.bounds))
-                .filter(|bounds| !bounds.is_empty())
-                .collect()
-        };
+        let holds_pointer = prompt_element.is_some() || active_drag_element.is_some();
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
@@ -4602,7 +4639,6 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
 
-        self.next_frame.overlay_scene_start = self.next_frame.scene.len();
         self.paint_deferred_draws(cx);
 
         if let Some(mut prompt_element) = prompt_element {
@@ -4612,6 +4648,9 @@ impl Window {
         } else if let Some(mut tooltip_element) = tooltip_element {
             tooltip_element.paint(self, cx);
         }
+        let pointer = holds_pointer.then(|| Bounds::new(Point::default(), root_size));
+        self.next_frame
+            .lift_over_native_views(pointer, overlay_hitboxes_end, scale_factor);
         crate::frame_stats::record(crate::frame_stats::Phase::Paint, frame_stats_paint);
 
         #[cfg(feature = "profiler")]
@@ -6726,6 +6765,38 @@ impl Window {
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
+    }
+
+    /// Says that a native view shows over `hitbox`, at this point in paint order. Whatever is
+    /// painted after it, such as a later pane, a popover or a toast, then draws above the view
+    /// where they overlap, as it would over anything GPUI drew; what was painted before stays
+    /// under it.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_native_view(&mut self, hitbox: &Hitbox) {
+        self.invalidator.debug_assert_paint();
+        let scale_factor = self.scale_factor();
+        let shown = hitbox.bounds.intersect(&self.content_mask().bounds);
+        if shown.is_empty() {
+            return;
+        }
+        self.next_frame.scene.mark_native_view(NativeViewMark {
+            bounds: shown.scale(scale_factor),
+            hitbox: hitbox.id,
+        });
+    }
+
+    /// Where the last frame drew above its native views, and which of those places take the
+    /// pointer from them, so a test can check what shows over a native view.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_over_native_views(&self) -> (Vec<Bounds<ScaledPixels>>, Vec<Bounds<Pixels>>) {
+        let frame = &self.rendered_frame;
+        let drawn = frame
+            .lifted
+            .iter()
+            .flat_map(|run| frame.scene.drawn_bounds(run.clone()))
+            .collect();
+        (drawn, frame.overlay_input.clone())
     }
 
     /// Set a hitbox which will act as a control area of the platform window.

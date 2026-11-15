@@ -2341,28 +2341,28 @@ impl PlatformWindow for MacWindow {
     fn draw_layered(
         &self,
         scene: &gpui::Scene,
-        overlay_start: usize,
+        lifted: &[std::ops::Range<usize>],
         overlay_input: &[Bounds<Pixels>],
     ) {
         let mut state = self.0.lock();
         state.draw_ground(scene);
-        if state.overlay_renderer.is_none() {
+        let Some(overlay_view) = state
+            .overlay_view
+            .filter(|_| state.overlay_renderer.is_some())
+        else {
             state.renderer.draw(scene);
             return;
-        }
-        let split = overlay_start.min(scene.len());
-        let mut base = gpui::Scene::default();
-        base.replay(0..split, scene);
-        base.finish();
-        let mut overlay = gpui::Scene::default();
-        overlay.replay(split..scene.len(), scene);
-        overlay.finish();
-        let visible = !overlay.is_empty();
-        *state.overlay_input.lock() = if visible {
-            overlay_input.to_vec()
-        } else {
-            Vec::new()
         };
+        if lifted.is_empty() {
+            state.overlay_input.lock().clear();
+            state.renderer.draw(scene);
+            unsafe {
+                let _: () = msg_send![overlay_view.as_ptr(), setHidden: Bool::new(true)];
+            }
+            return;
+        }
+        let (base, overlay) = scene.split(lifted);
+        *state.overlay_input.lock() = overlay_input.to_vec();
         let size = state.content_size();
         let scale = state.scale_factor();
         if state.overlay_size != Some((size, scale)) {
@@ -2377,12 +2377,9 @@ impl PlatformWindow for MacWindow {
             state.overlay_size = Some((size, scale));
         }
         state.renderer.draw(&base);
-        if visible {
-            state.overlay_renderer.as_mut().unwrap().draw(&overlay);
-        }
+        state.overlay_renderer.as_mut().unwrap().draw(&overlay);
         unsafe {
-            let view = state.overlay_view.unwrap().as_ptr();
-            let _: () = msg_send![view, setHidden: Bool::new(!visible)];
+            let _: () = msg_send![overlay_view.as_ptr(), setHidden: Bool::new(false)];
         }
     }
 
