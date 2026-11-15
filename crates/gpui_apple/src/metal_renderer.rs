@@ -654,6 +654,19 @@ impl MetalRenderer {
         renderer
     }
 
+    /// Swaps the overlay's layer for a fresh one, so the drawables the old one kept are freed,
+    /// along with the offscreen targets drawn through for it. The caller shows the new layer
+    /// where the old one was; it allocates nothing until a frame draws into it.
+    pub fn renew_overlay_layer(&mut self) -> *mut CAMetalLayer {
+        let layer = metal::MetalLayer::new();
+        Self::configure_layer(&layer, &self.device, true, false);
+        layer.set_presents_with_transaction(self.presents_with_transaction);
+        self.layer = Some(layer);
+        self.path_targets = None;
+        self.filter_targets = FilterTargets::default();
+        self.layer_ptr()
+    }
+
     /// A renderer on the same device, atlas and clock for the layer behind the window's drawing,
     /// which shows only the ground and its shaders.
     pub fn new_ground(&self) -> Self {

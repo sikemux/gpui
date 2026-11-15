@@ -70,13 +70,16 @@ use std::{
         Arc, Once, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const WINDOW_STATE_IVAR: &CStr = c"windowState";
 /// How many display ticks in a row may ask for nothing before the window stops taking them,
 /// until something asks for a frame again.
 const IDLE_TICKS_BEFORE_STOP: u8 = 4;
+/// How long the overlay plane stays hidden before its drawables are given back. A menu opened
+/// again within it draws at once; later, its first frame allocates them afresh.
+const OVERLAY_RELEASE: Duration = Duration::from_secs(5);
 const OVERLAY_INPUT_IVAR: &CStr = c"overlayInput";
 static mut OVERLAY_VIEW_CLASS: *const AnyClass = ptr::null();
 
@@ -739,6 +742,11 @@ struct MacWindowState {
     overlay_view: Option<NonNull<AnyObject>>,
     overlay_input: Arc<Mutex<Vec<Bounds<Pixels>>>>,
     overlay_size: Option<(Size<Pixels>, f32)>,
+    /// When frames stopped drawing anything over native views, while they still do not.
+    overlay_hidden_since: Option<Instant>,
+    /// Whether the overlay's layer holds drawables from frames it drew, which a hidden layer
+    /// keeps until it is replaced.
+    overlay_drawn: bool,
     /// The layer behind the drawing that shows the window's ground, made the first time a
     /// frame has one.
     ground_renderer: Option<renderer::Renderer>,
@@ -820,6 +828,24 @@ fn same_shaders(a: &[gpui::PaintRawShader], b: &[gpui::PaintRawShader]) -> bool 
 }
 
 impl MacWindowState {
+    /// Gives back the screen-sized drawables and targets the hidden overlay plane still holds,
+    /// by giving it a fresh layer that allocates nothing until a frame draws over native views.
+    fn release_overlay(&mut self) {
+        if !self.overlay_drawn {
+            return;
+        }
+        let (Some(renderer), Some(view)) = (self.overlay_renderer.as_mut(), self.overlay_view)
+        else {
+            return;
+        };
+        let layer = renderer.renew_overlay_layer().cast::<AnyObject>();
+        unsafe {
+            let _: () = msg_send![view.as_ptr(), setLayer: layer];
+        }
+        self.overlay_size = None;
+        self.overlay_drawn = false;
+    }
+
     /// While native views sit between the planes, each frame presents in the transaction that
     /// moves them, so a page and the GPUI around it change size in the same frame.
     fn set_presents_with_transaction(&mut self, synchronous: bool) {
@@ -1329,6 +1355,8 @@ impl MacWindow {
                 overlay_view: None,
                 overlay_input: Arc::default(),
                 overlay_size: None,
+                overlay_hidden_since: None,
+                overlay_drawn: false,
                 ground_renderer: None,
                 ground_view: None,
                 ground_size: None,
@@ -2404,6 +2432,10 @@ impl PlatformWindow for MacWindow {
             unsafe {
                 let _: () = msg_send![overlay_view.as_ptr(), setHidden: Bool::new(true)];
             }
+            let hidden_since = *state.overlay_hidden_since.get_or_insert_with(Instant::now);
+            if hidden_since.elapsed() >= OVERLAY_RELEASE {
+                state.release_overlay();
+            }
             return;
         }
         let (base, overlay) = scene.split(lifted);
@@ -2423,6 +2455,8 @@ impl PlatformWindow for MacWindow {
         }
         state.renderer.draw(&base);
         state.overlay_renderer.as_mut().unwrap().draw(&overlay);
+        state.overlay_hidden_since = None;
+        state.overlay_drawn = true;
         unsafe {
             let _: () = msg_send![overlay_view.as_ptr(), setHidden: Bool::new(false)];
         }
@@ -2479,7 +2513,13 @@ impl PlatformWindow for MacWindow {
     }
 
     fn release_idle_gpu_memory(&self) {
-        self.0.lock().renderer.release_idle_targets();
+        let mut state = self.0.lock();
+        state.renderer.release_idle_targets();
+        if state.overlay_hidden_since.is_some() {
+            state.release_overlay();
+        } else if let Some(overlay) = state.overlay_renderer.as_mut() {
+            overlay.release_idle_targets();
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
