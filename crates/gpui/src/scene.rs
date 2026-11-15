@@ -144,9 +144,9 @@ impl Scene {
     ) -> (Vec<Range<usize>>, Vec<Bounds<ScaledPixels>>) {
         let natives: SmallVec<[Bounds<ScaledPixels>; 4]> =
             self.native_views().map(|(_, mark)| mark.bounds).collect();
-        let (mut runs, mut drawn_by_run) = (Vec::new(), Vec::<Bounds<ScaledPixels>>::new());
+        let (mut runs, mut drawn) = (Vec::new(), Vec::<Bounds<ScaledPixels>>::new());
         let Some((first, _)) = self.native_views().next() else {
-            return (runs, drawn_by_run);
+            return (runs, drawn);
         };
         let (mut painted, mut open) = (0, false);
         for (index, operation) in self.paint_operations.iter().enumerate().skip(first) {
@@ -159,35 +159,28 @@ impl Scene {
                 _ => continue,
             };
             let pieces = self::painted(primitive);
-            let Some(drawn) = pieces
-                .iter()
-                .copied()
-                .reduce(|all, piece| all.union(&piece))
-            else {
+            if pieces.is_empty() {
                 continue;
-            };
+            }
             let (before, after) = natives.split_at(painted);
             let touches =
                 |area: &Bounds<ScaledPixels>| pieces.iter().any(|piece| area.intersects(piece));
-            let over = before.iter().any(touches) || drawn_by_run.iter().any(touches);
+            let over = before.iter().any(touches) || drawn.iter().any(touches);
             let under = after.iter().any(touches);
             if !over || under {
                 open = false;
                 continue;
             }
-            match (open, runs.last_mut(), drawn_by_run.last_mut()) {
-                (true, Some(run), Some(run_drawn)) => {
-                    *run = run.start..index + 1;
-                    *run_drawn = run_drawn.union(&drawn);
-                }
-                _ => {
-                    runs.push(index..index + 1);
-                    drawn_by_run.push(drawn);
-                }
+            match (open, runs.last_mut()) {
+                (true, Some(run)) => *run = run.start..index + 1,
+                _ => runs.push(index..index + 1),
+            }
+            for piece in pieces {
+                keep_outermost(&mut drawn, piece);
             }
             open = true;
         }
-        (runs, drawn_by_run)
+        (runs, drawn)
     }
 
     /// This scene as what is drawn beneath native views and what `lifted` puts above them.
@@ -521,6 +514,28 @@ pub(crate) enum PaintOperation {
     EndFilter,
     /// Where a native view sits in paint order: what is painted after it is drawn above it.
     NativeView(NativeViewMark),
+}
+
+/// `drawn` less every rectangle that lies within another, so a menu's glyphs fold into its
+/// background. Rectangles that only touch stay apart, as a border's four sides joined would
+/// cover what they frame.
+pub fn outermost(drawn: impl Iterator<Item = Bounds<ScaledPixels>>) -> Vec<Bounds<ScaledPixels>> {
+    let mut kept = Vec::new();
+    for bounds in drawn {
+        keep_outermost(&mut kept, bounds);
+    }
+    kept
+}
+
+fn keep_outermost(kept: &mut Vec<Bounds<ScaledPixels>>, bounds: Bounds<ScaledPixels>) {
+    let within = |inner: &Bounds<ScaledPixels>, outer: &Bounds<ScaledPixels>| {
+        outer.dilate(ScaledPixels(1.)).intersect(inner) == *inner
+    };
+    if kept.iter().any(|other| within(&bounds, other)) {
+        return;
+    }
+    kept.retain(|other| !within(other, &bounds));
+    kept.push(bounds);
 }
 
 /// A native view shown over `bounds`, which takes the pointer through `hitbox`.

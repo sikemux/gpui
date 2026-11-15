@@ -368,21 +368,6 @@ impl rwh::HasDisplayHandle for X11Window {
     }
 }
 
-/// Joins rectangles that overlap or touch, so a menu's glyphs fold into its background.
-fn merge_touching(drawn: impl Iterator<Item = Bounds<ScaledPixels>>) -> Vec<Bounds<ScaledPixels>> {
-    let mut merged: Vec<Bounds<ScaledPixels>> = Vec::new();
-    for mut bounds in drawn {
-        while let Some(index) = merged
-            .iter()
-            .position(|other| other.dilate(ScaledPixels(1.)).intersects(&bounds))
-        {
-            bounds = bounds.union(&merged.swap_remove(index));
-        }
-        merged.push(bounds);
-    }
-    merged
-}
-
 /// A native child's shape: its whole area, less holes where the window draws over it and less
 /// holes where the window takes the pointer from it, in the child's own pixels.
 struct ChildCut {
@@ -433,10 +418,7 @@ fn cut_child(
     whole: xproto::Rectangle,
     holes: &[xproto::Rectangle],
 ) {
-    for (operation, rectangles) in [
-        (shape::SO::SET, &[whole][..]),
-        (shape::SO::SUBTRACT, holes),
-    ] {
+    for (operation, rectangles) in [(shape::SO::SET, &[whole][..]), (shape::SO::SUBTRACT, holes)] {
         xcb.shape_rectangles(
             operation,
             kind,
@@ -1018,7 +1000,7 @@ impl X11Window {
             let state = self.0.state.borrow();
             (state.scale_factor, !state.native_children_cuts.is_empty())
         };
-        let shown = merge_touching(drawn);
+        let shown = gpui::outermost(drawn);
         let taking = if shown.is_empty() {
             Vec::new()
         } else {
