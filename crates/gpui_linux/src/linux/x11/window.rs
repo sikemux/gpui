@@ -12,7 +12,7 @@ use gpui::{
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
-use collections::FxHashSet;
+use collections::{FxHashMap, FxHashSet};
 use gpui_util::{ResultExt, maybe};
 use raw_window_handle as rwh;
 use x11rb::{
@@ -21,6 +21,7 @@ use x11rb::{
     errors::ConnectionError,
     properties::{WmHints, WmSizeHints},
     protocol::{
+        shape::{self, ConnectionExt as _},
         sync,
         xinput::{self, ConnectionExt as _},
         xproto::{self, ClientMessageEvent, ConnectionExt, TranslateCoordinatesReply},
@@ -284,6 +285,9 @@ pub struct X11WindowState {
     /// `VisibilityNotify`; this is the last value it reported.
     visibility: WindowVisibility,
     hovered: bool,
+    /// The shape each native child window was last given, so a frame that leaves it unchanged
+    /// sends nothing: every reshape exposes this window, and each expose presents a frame.
+    native_children_cuts: FxHashMap<xproto::Window, ChildCut>,
     force_render_after_recovery: bool,
     fullscreen: bool,
     client_side_decorations_supported: bool,
@@ -361,6 +365,70 @@ impl rwh::HasDisplayHandle for X11Window {
         };
         let handle = rwh::XcbDisplayHandle::new(Some(non_zero), screen_id);
         Ok(unsafe { rwh::DisplayHandle::borrow_raw(handle.into()) })
+    }
+}
+
+/// A native child's shape: its whole area, less holes where the window draws over it and less
+/// holes where the window takes the pointer from it, in the child's own pixels.
+struct ChildCut {
+    whole: xproto::Rectangle,
+    drawn: Vec<xproto::Rectangle>,
+    taking: Vec<xproto::Rectangle>,
+}
+
+impl PartialEq for ChildCut {
+    fn eq(&self, other: &Self) -> bool {
+        let corners = |rectangles: &[xproto::Rectangle]| {
+            rectangles
+                .iter()
+                .map(|r| (r.x, r.y, r.width, r.height))
+                .collect::<Vec<_>>()
+        };
+        corners(&[self.whole]) == corners(&[other.whole])
+            && corners(&self.drawn) == corners(&other.drawn)
+            && corners(&self.taking) == corners(&other.taking)
+    }
+}
+
+/// `holes`, in this window's device pixels, as rectangles in `child`'s own.
+fn holes_in(
+    geometry: &xproto::GetGeometryReply,
+    holes: &[Bounds<ScaledPixels>],
+) -> Vec<xproto::Rectangle> {
+    holes
+        .iter()
+        .map(|hole| {
+            let (left, top) = (hole.left().0.floor(), hole.top().0.floor());
+            let (right, bottom) = (hole.right().0.ceil(), hole.bottom().0.ceil());
+            xproto::Rectangle {
+                x: (left - f32::from(geometry.x)) as i16,
+                y: (top - f32::from(geometry.y)) as i16,
+                width: (right - left) as u16,
+                height: (bottom - top) as u16,
+            }
+        })
+        .collect()
+}
+
+/// Shapes `child`'s `kind` region to its whole area less `holes`.
+fn cut_child(
+    xcb: &XCBConnection,
+    child: xproto::Window,
+    kind: shape::SK,
+    whole: xproto::Rectangle,
+    holes: &[xproto::Rectangle],
+) {
+    for (operation, rectangles) in [(shape::SO::SET, &[whole][..]), (shape::SO::SUBTRACT, holes)] {
+        xcb.shape_rectangles(
+            operation,
+            kind,
+            xproto::ClipOrdering::UNSORTED,
+            child,
+            0,
+            0,
+            rectangles,
+        )
+        .log_err();
     }
 }
 
@@ -843,6 +911,7 @@ impl X11WindowState {
                 // The window is not mapped until the client sees `MapNotify`.
                 visibility: WindowVisibility::Hidden,
                 hovered: false,
+                native_children_cuts: FxHashMap::default(),
                 force_render_after_recovery: false,
                 fullscreen: false,
                 maximized_vertical: false,
@@ -918,6 +987,80 @@ enum WmHintPropertyState {
 }
 
 impl X11Window {
+    /// Native views, such as web pages other connections draw, are child windows over this
+    /// window's drawing. Where deferred draws such as menus show, the children are cut away so
+    /// those show through, and where the deferred draws take the pointer, the children let it
+    /// pass to this window, as the overlay plane does on macOS.
+    fn cut_native_children(
+        &self,
+        drawn: impl Iterator<Item = Bounds<ScaledPixels>>,
+        overlay_input: &[Bounds<Pixels>],
+    ) {
+        let (scale, cut) = {
+            let state = self.0.state.borrow();
+            (state.scale_factor, !state.native_children_cuts.is_empty())
+        };
+        let shown = gpui::outermost(drawn);
+        let taking = if shown.is_empty() {
+            Vec::new()
+        } else {
+            overlay_input
+                .iter()
+                .map(|bounds| bounds.scale(scale))
+                .collect()
+        };
+        if shown.is_empty() && !cut {
+            return;
+        }
+        let xcb = &self.0.xcb;
+        let Some(tree) = xcb
+            .query_tree(self.0.x_window)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        else {
+            return;
+        };
+        let mut last = std::mem::take(&mut self.0.state.borrow_mut().native_children_cuts);
+        let mut cuts = FxHashMap::default();
+        for child in tree.children {
+            if shown.is_empty() {
+                for kind in [shape::SK::BOUNDING, shape::SK::INPUT] {
+                    xcb.shape_mask(shape::SO::SET, kind, child, 0, 0, x11rb::NONE)
+                        .log_err();
+                }
+                continue;
+            }
+            let Some(geometry) = xcb
+                .get_geometry(child)
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+            else {
+                continue;
+            };
+            let child_cut = ChildCut {
+                whole: xproto::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: geometry.width,
+                    height: geometry.height,
+                },
+                drawn: holes_in(&geometry, &shown),
+                taking: holes_in(&geometry, &taking),
+            };
+            if last.remove(&child).as_ref() != Some(&child_cut) {
+                for (kind, holes) in [
+                    (shape::SK::BOUNDING, &child_cut.drawn),
+                    (shape::SK::INPUT, &child_cut.taking),
+                ] {
+                    cut_child(xcb, child, kind, child_cut.whole, holes);
+                }
+            }
+            cuts.insert(child, child_cut);
+        }
+        xcb_flush(xcb);
+        self.0.state.borrow_mut().native_children_cuts = cuts;
+    }
+
     pub fn new(
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
@@ -1800,6 +1943,21 @@ impl PlatformWindow for X11Window {
         if renderer.needs_redraw() {
             inner.force_render_after_recovery = true;
         }
+    }
+
+    fn draw_layered(
+        &self,
+        scene: &Scene,
+        lifted: &[std::ops::Range<usize>],
+        overlay_input: &[Bounds<Pixels>],
+    ) {
+        self.draw(scene);
+        self.cut_native_children(
+            lifted
+                .iter()
+                .flat_map(|run| scene.drawn_bounds(run.clone())),
+            overlay_input,
+        );
     }
 
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {

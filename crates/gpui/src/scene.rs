@@ -516,8 +516,17 @@ pub(crate) enum PaintOperation {
     NativeView(NativeViewMark),
 }
 
-/// Adds `bounds` to `kept` unless it lies within one there, dropping any that lie within it, so
-/// a menu's glyphs fold into its background while a border's four sides stay apart.
+/// `drawn` less every rectangle that lies within another, so a menu's glyphs fold into its
+/// background. Rectangles that only touch stay apart, as a border's four sides joined would
+/// cover what they frame.
+pub fn outermost(drawn: impl Iterator<Item = Bounds<ScaledPixels>>) -> Vec<Bounds<ScaledPixels>> {
+    let mut kept = Vec::new();
+    for bounds in drawn {
+        keep_outermost(&mut kept, bounds);
+    }
+    kept
+}
+
 fn keep_outermost(kept: &mut Vec<Bounds<ScaledPixels>>, bounds: Bounds<ScaledPixels>) {
     let within = |inner: &Bounds<ScaledPixels>, outer: &Bounds<ScaledPixels>| {
         outer.dilate(ScaledPixels(1.)).intersect(inner) == *inner
