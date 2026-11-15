@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, HitboxId, Hsla,
-    Pixels, Point, Radians, ScaledPixels, ShaderId, Size, bounds_tree::BoundsTree, point,
+    Pixels, Point, Radians, ScaledPixels, ShaderId, Size, bounds_tree::BoundsTree, point, size,
 };
 use std::{
     fmt::Debug,
@@ -110,16 +110,13 @@ impl Scene {
     ) -> impl Iterator<Item = Bounds<ScaledPixels>> + '_ {
         self.paint_operations[range]
             .iter()
-            .filter_map(|operation| match operation {
+            .flat_map(|operation| match operation {
                 PaintOperation::Primitive(primitive)
                     if !matches!(primitive, Primitive::Shadow(_)) =>
                 {
-                    let drawn = primitive
-                        .bounds()
-                        .intersect(&primitive.content_mask().bounds);
-                    (!drawn.is_empty()).then_some(drawn)
+                    painted(primitive)
                 }
-                _ => None,
+                _ => SmallVec::new(),
             })
     }
 
@@ -161,13 +158,19 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => primitive,
                 _ => continue,
             };
-            let drawn = primitive
-                .bounds()
-                .intersect(&primitive.content_mask().bounds);
+            let pieces = self::painted(primitive);
+            let Some(drawn) = pieces
+                .iter()
+                .copied()
+                .reduce(|all, piece| all.union(&piece))
+            else {
+                continue;
+            };
             let (before, after) = natives.split_at(painted);
-            let over = before.iter().any(|native| native.intersects(&drawn))
-                || drawn_by_run.iter().any(|run| run.intersects(&drawn));
-            let under = after.iter().any(|native| native.intersects(&drawn));
+            let touches =
+                |area: &Bounds<ScaledPixels>| pieces.iter().any(|piece| area.intersects(piece));
+            let over = before.iter().any(touches) || drawn_by_run.iter().any(touches);
+            let under = after.iter().any(touches);
             if !over || under {
                 open = false;
                 continue;
@@ -521,6 +524,41 @@ pub(crate) enum PaintOperation {
 }
 
 /// A native view shown over `bounds`, which takes the pointer through `hitbox`.
+/// Where `primitive` paints, cut to its content mask: a quad with a transparent fill paints only
+/// its border, which GPUI draws after an element's children, over all of them.
+fn painted(primitive: &Primitive) -> SmallVec<[Bounds<ScaledPixels>; 4]> {
+    let mask = &primitive.content_mask().bounds;
+    let whole = *primitive.bounds();
+    let pieces: SmallVec<[Bounds<ScaledPixels>; 4]> = match primitive {
+        Primitive::Quad(quad) if quad.background.is_transparent() => {
+            let edges = quad.border_widths;
+            let (left, top) = (whole.left(), whole.top());
+            let (width, height) = (whole.size.width, whole.size.height);
+            let middle = height - edges.top - edges.bottom;
+            [
+                Bounds::new(point(left, top), size(width, edges.top)),
+                Bounds::new(
+                    point(left, whole.bottom() - edges.bottom),
+                    size(width, edges.bottom),
+                ),
+                Bounds::new(point(left, top + edges.top), size(edges.left, middle)),
+                Bounds::new(
+                    point(whole.right() - edges.right, top + edges.top),
+                    size(edges.right, middle),
+                ),
+            ]
+            .into_iter()
+            .collect()
+        }
+        _ => SmallVec::from_buf_and_len([whole; 4], 1),
+    };
+    pieces
+        .into_iter()
+        .map(|piece| piece.intersect(mask))
+        .filter(|piece| !piece.is_empty())
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeViewMark {
     pub(crate) bounds: Bounds<ScaledPixels>,
