@@ -531,7 +531,8 @@ fn keep_outermost(kept: &mut Vec<Bounds<ScaledPixels>>, bounds: Bounds<ScaledPix
 
 /// A native view shown over `bounds`, which takes the pointer through `hitbox`.
 /// Where `primitive` paints, cut to its content mask: a quad with a transparent fill paints only
-/// its border, which GPUI draws after an element's children, over all of them.
+/// its border, which GPUI draws after an element's children, over all of them, and a path only
+/// its triangles, so a stroked outline does not count as the box it frames.
 fn painted(primitive: &Primitive) -> SmallVec<[Bounds<ScaledPixels>; 4]> {
     let mask = &primitive.content_mask().bounds;
     let whole = *primitive.bounds();
@@ -556,6 +557,14 @@ fn painted(primitive: &Primitive) -> SmallVec<[Bounds<ScaledPixels>; 4]> {
             .into_iter()
             .collect()
         }
+        Primitive::Path(path) => path
+            .vertices
+            .chunks_exact(3)
+            .map(|triangle| {
+                let [a, b, c] = [0, 1, 2].map(|i| triangle[i].xy_position);
+                Bounds::from_corners(a.min(&b).min(&c), a.max(&b).max(&c))
+            })
+            .collect(),
         _ => SmallVec::from_buf_and_len([whole; 4], 1),
     };
     pieces
