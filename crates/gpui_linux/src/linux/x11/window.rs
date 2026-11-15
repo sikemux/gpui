@@ -12,7 +12,7 @@ use gpui::{
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
-use collections::FxHashSet;
+use collections::{FxHashMap, FxHashSet};
 use gpui_util::{ResultExt, maybe};
 use raw_window_handle as rwh;
 use x11rb::{
@@ -285,9 +285,9 @@ pub struct X11WindowState {
     /// `VisibilityNotify`; this is the last value it reported.
     visibility: WindowVisibility,
     hovered: bool,
-    /// Whether native child windows are cut around deferred draws, so they're restored once
-    /// those close.
-    native_children_cut: bool,
+    /// The shape each native child window was last given, so a frame that leaves it unchanged
+    /// sends nothing: every reshape exposes this window, and each expose presents a frame.
+    native_children_cuts: FxHashMap<xproto::Window, ChildCut>,
     force_render_after_recovery: bool,
     fullscreen: bool,
     client_side_decorations_supported: bool,
@@ -383,22 +383,34 @@ fn merge_touching(drawn: impl Iterator<Item = Bounds<ScaledPixels>>) -> Vec<Boun
     merged
 }
 
-/// Shapes `child`'s `kind` region to its whole area less `holes`, which are in this window's
-/// device pixels.
-fn cut_child(
-    xcb: &XCBConnection,
-    child: xproto::Window,
+/// A native child's shape: its whole area, less holes where the window draws over it and less
+/// holes where the window takes the pointer from it, in the child's own pixels.
+struct ChildCut {
+    whole: xproto::Rectangle,
+    drawn: Vec<xproto::Rectangle>,
+    taking: Vec<xproto::Rectangle>,
+}
+
+impl PartialEq for ChildCut {
+    fn eq(&self, other: &Self) -> bool {
+        let corners = |rectangles: &[xproto::Rectangle]| {
+            rectangles
+                .iter()
+                .map(|r| (r.x, r.y, r.width, r.height))
+                .collect::<Vec<_>>()
+        };
+        corners(&[self.whole]) == corners(&[other.whole])
+            && corners(&self.drawn) == corners(&other.drawn)
+            && corners(&self.taking) == corners(&other.taking)
+    }
+}
+
+/// `holes`, in this window's device pixels, as rectangles in `child`'s own.
+fn holes_in(
     geometry: &xproto::GetGeometryReply,
-    kind: shape::SK,
     holes: &[Bounds<ScaledPixels>],
-) {
-    let whole = xproto::Rectangle {
-        x: 0,
-        y: 0,
-        width: geometry.width,
-        height: geometry.height,
-    };
-    let holes: Vec<xproto::Rectangle> = holes
+) -> Vec<xproto::Rectangle> {
+    holes
         .iter()
         .map(|hole| {
             let (left, top) = (hole.left().0.floor(), hole.top().0.floor());
@@ -410,10 +422,20 @@ fn cut_child(
                 height: (bottom - top) as u16,
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Shapes `child`'s `kind` region to its whole area less `holes`.
+fn cut_child(
+    xcb: &XCBConnection,
+    child: xproto::Window,
+    kind: shape::SK,
+    whole: xproto::Rectangle,
+    holes: &[xproto::Rectangle],
+) {
     for (operation, rectangles) in [
         (shape::SO::SET, &[whole][..]),
-        (shape::SO::SUBTRACT, &holes),
+        (shape::SO::SUBTRACT, holes),
     ] {
         xcb.shape_rectangles(
             operation,
@@ -907,7 +929,7 @@ impl X11WindowState {
                 // The window is not mapped until the client sees `MapNotify`.
                 visibility: WindowVisibility::Hidden,
                 hovered: false,
-                native_children_cut: false,
+                native_children_cuts: FxHashMap::default(),
                 force_render_after_recovery: false,
                 fullscreen: false,
                 maximized_vertical: false,
@@ -994,7 +1016,7 @@ impl X11Window {
     ) {
         let (scale, cut) = {
             let state = self.0.state.borrow();
-            (state.scale_factor, state.native_children_cut)
+            (state.scale_factor, !state.native_children_cuts.is_empty())
         };
         let shown = merge_touching(drawn);
         let taking = if shown.is_empty() {
@@ -1016,6 +1038,8 @@ impl X11Window {
         else {
             return;
         };
+        let mut last = std::mem::take(&mut self.0.state.borrow_mut().native_children_cuts);
+        let mut cuts = FxHashMap::default();
         for child in tree.children {
             if shown.is_empty() {
                 for kind in [shape::SK::BOUNDING, shape::SK::INPUT] {
@@ -1031,12 +1055,28 @@ impl X11Window {
             else {
                 continue;
             };
-            for (kind, holes) in [(shape::SK::BOUNDING, &shown), (shape::SK::INPUT, &taking)] {
-                cut_child(xcb, child, &geometry, kind, holes);
+            let child_cut = ChildCut {
+                whole: xproto::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: geometry.width,
+                    height: geometry.height,
+                },
+                drawn: holes_in(&geometry, &shown),
+                taking: holes_in(&geometry, &taking),
+            };
+            if last.remove(&child).as_ref() != Some(&child_cut) {
+                for (kind, holes) in [
+                    (shape::SK::BOUNDING, &child_cut.drawn),
+                    (shape::SK::INPUT, &child_cut.taking),
+                ] {
+                    cut_child(xcb, child, kind, child_cut.whole, holes);
+                }
             }
+            cuts.insert(child, child_cut);
         }
         xcb_flush(xcb);
-        self.0.state.borrow_mut().native_children_cut = !shown.is_empty();
+        self.0.state.borrow_mut().native_children_cuts = cuts;
     }
 
     pub fn new(
