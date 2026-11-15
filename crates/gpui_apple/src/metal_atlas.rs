@@ -108,10 +108,12 @@ impl MetalAtlasTextures {
                 AtlasTextureKind::Subpixel => unreachable!(),
             };
 
-            if let Some(tile) = textures
-                .iter_mut()
-                .rev()
-                .find_map(|texture| texture.allocate(size))
+            if !own_texture(size)
+                && let Some(tile) = textures
+                    .iter_mut()
+                    .rev()
+                    .filter(|texture| !texture.own)
+                    .find_map(|texture| texture.allocate(size))
             {
                 return Some(tile);
             }
@@ -135,7 +137,11 @@ impl MetalAtlasTextures {
             width: DevicePixels(16384),
             height: DevicePixels(16384),
         };
-        let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
+        let own = own_texture(min_size);
+        let size = match own {
+            true => min_size.min(&MAX_ATLAS_SIZE),
+            false => min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE),
+        };
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.into());
         texture_descriptor.set_height(size.height.into());
@@ -179,6 +185,7 @@ impl MetalAtlasTextures {
             allocator: etagere::BucketedAtlasAllocator::new(size_to_etagere(size)),
             metal_texture: AssertSend(metal_texture),
             live_atlas_keys: 0,
+            own,
         };
 
         if let Some(ix) = index {
@@ -203,11 +210,21 @@ impl MetalAtlasTextures {
     }
 }
 
+/// Whether a tile of `size` gets a texture of its own, exactly its size. A picture that large
+/// would leave most of a shared page empty, and keep the whole page alive after the pictures
+/// beside it are dropped.
+fn own_texture(size: Size<DevicePixels>) -> bool {
+    const OWN_TEXTURE_AREA: i64 = 256 * 256;
+    i64::from(size.width.0) * i64::from(size.height.0) >= OWN_TEXTURE_AREA
+}
+
 struct MetalAtlasTexture {
     id: AtlasTextureId,
     allocator: BucketedAtlasAllocator,
     metal_texture: AssertSend<metal::Texture>,
     live_atlas_keys: u32,
+    /// Holds one tile alone, freed with it.
+    own: bool,
 }
 
 impl MetalAtlasTexture {
@@ -367,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_deallocates_tile_space_for_reuse() {
+    fn test_a_large_picture_takes_a_texture_of_its_own_freed_with_it() {
         let Some(atlas) = create_atlas() else {
             return;
         };
@@ -387,11 +404,13 @@ mod tests {
 
         let keeper_tile = insert_tile(&atlas, keeper_key, small);
         let tile_a = insert_tile(&atlas, big_key_a.clone(), big);
-        assert_eq!(keeper_tile.texture_id, tile_a.texture_id);
+        assert_ne!(keeper_tile.texture_id, tile_a.texture_id);
 
         atlas.remove(&big_key_a);
+        assert!(atlas.metal_texture(tile_a.texture_id).is_none());
         let tile_b = insert_tile(&atlas, big_key_b, big);
-        assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+        assert_ne!(tile_b.texture_id, keeper_tile.texture_id);
+        assert!(atlas.metal_texture(keeper_tile.texture_id).is_some());
     }
 
     #[test]
