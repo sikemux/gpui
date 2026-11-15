@@ -1318,17 +1318,18 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
-    /// Draws the scene from `overlay_start` on a plane above native child views, when enabled.
-    /// The plane takes the pointer only inside `overlay_input`, so a native view keeps the rest.
+    /// Draws the paint operations in `lifted` on a plane above native child views, when one is
+    /// enabled, and the rest beneath them. The plane takes the pointer only inside
+    /// `overlay_input`, so a native view keeps the rest.
     fn draw_layered(
         &self,
         scene: &Scene,
-        _overlay_start: usize,
+        _lifted: &[std::ops::Range<usize>],
         _overlay_input: &[Bounds<Pixels>],
     ) {
         self.draw(scene);
     }
-    /// Adds a transparent plane above native child views for deferred draws.
+    /// Adds a transparent plane above native child views, for what draws over them.
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {
         anyhow::bail!("scene overlays are not supported on this platform")
     }

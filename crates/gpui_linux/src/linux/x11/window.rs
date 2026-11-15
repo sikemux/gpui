@@ -1923,10 +1923,19 @@ impl PlatformWindow for X11Window {
         }
     }
 
-    fn draw_layered(&self, scene: &Scene, overlay_start: usize, overlay_input: &[Bounds<Pixels>]) {
+    fn draw_layered(
+        &self,
+        scene: &Scene,
+        lifted: &[std::ops::Range<usize>],
+        overlay_input: &[Bounds<Pixels>],
+    ) {
         self.draw(scene);
-        let start = overlay_start.min(scene.len());
-        self.cut_native_children(scene.drawn_bounds(start..scene.len()), overlay_input);
+        self.cut_native_children(
+            lifted
+                .iter()
+                .flat_map(|run| scene.drawn_bounds(run.clone())),
+            overlay_input,
+        );
     }
 
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {
