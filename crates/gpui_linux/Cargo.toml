@@ -122,7 +122,6 @@ x11rb = { version = "0.13.1", features = [
     "xinput",
     "cursor",
     "resource_manager",
-    "shape",
     "sync",
     "dri3",
 ], optional = true }
