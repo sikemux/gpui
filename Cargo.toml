@@ -194,18 +194,11 @@ idna = "1.0"
 ignore = "0.4.22"
 image = { version = "0.25.1", default-features = false, features = [
     "bmp",
-    "dds",
-    "exr",
-    "ff",
     "gif",
-    "hdr",
     "ico",
     "jpeg",
     "png",
-    "pnm",
-    "qoi",
     "rayon",
-    "tga",
     "tiff",
     "webp",
 ] }
