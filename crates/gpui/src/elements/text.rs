@@ -1497,6 +1497,28 @@ mod tests {
                 gapped[0].gap_origin(3, px(20.)),
                 Some(crate::point(x(&plain, 3) + px(10.), px(0.)))
             );
+
+            let text = SharedString::from("one\nab\nlonger line\nsee ab");
+            let runs = [window.text_style().to_run(text.len())];
+            let gap = text.rfind("ab").expect("in the text");
+            let lines = window
+                .text_system()
+                .shape_text_with_gaps(text.clone(), size, &runs, &[(gap, px(20.))], None, None)
+                .expect("shaped");
+            let plain = window
+                .text_system()
+                .shape_text_with_gaps(text, size, &runs, &[], None, None)
+                .expect("shaped");
+            assert_eq!(
+                lines[2].width(),
+                plain[2].width(),
+                "no gap on the line before"
+            );
+            assert_eq!(
+                lines[3].width(),
+                plain[3].width() + px(20.),
+                "the gap on its own line"
+            );
         });
     }
 

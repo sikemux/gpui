@@ -977,13 +977,14 @@ impl WindowTextSystem {
                 line_start,
                 line_start + second_line.len(),
             );
+            line_start += second_line.len() + '\n'.len_utf8();
             for line_text in split_lines {
-                line_start += line_text.len() + '\n'.len_utf8();
                 process_line(
                     SharedString::new(line_text),
                     line_start,
                     line_start + line_text.len(),
                 );
+                line_start += line_text.len() + '\n'.len_utf8();
             }
         } else {
             let end = text.len();
