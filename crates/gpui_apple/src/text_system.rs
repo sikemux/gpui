@@ -776,7 +776,10 @@ mod lenient_font_attributes {
 #[cfg(test)]
 mod tests {
     use crate::AppleTextSystem;
-    use gpui::{FontFallbacks, FontFeatures, FontRun, GlyphId, PlatformTextSystem, font, px};
+    use gpui::{
+        FontFallbacks, FontFeatures, FontRun, GlyphId, PlatformTextSystem, TextRun, TextSystem,
+        WindowTextSystem, font, px,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -803,6 +806,26 @@ mod tests {
         );
         assert_eq!(layout.len, 6);
         assert!(!layout.runs.is_empty());
+    }
+
+    #[test]
+    fn test_layout_line_font_change_inside_a_character() {
+        let text_system =
+            WindowTextSystem::new(Arc::new(TextSystem::new(Arc::new(AppleTextSystem::new()))));
+        let runs = [
+            TextRun {
+                len: 2,
+                font: font("Helvetica"),
+                ..Default::default()
+            },
+            TextRun {
+                len: 3,
+                font: font("Menlo"),
+                ..Default::default()
+            },
+        ];
+        let layout = text_system.layout_line("a转b", px(16.), &runs, None);
+        assert_eq!(layout.len, "a转b".len());
     }
 
     #[test]

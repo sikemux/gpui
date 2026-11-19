@@ -6,7 +6,7 @@ use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
 use std::{
-    borrow::Borrow,
+    borrow::{Borrow, Cow},
     hash::{Hash, Hasher},
     ops::Range,
     sync::{
@@ -914,6 +914,7 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
+            let runs = &*runs_on_char_boundaries(&text, runs);
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
@@ -1068,6 +1069,7 @@ impl LineLayoutCache {
         }
 
         let text = materialize_text();
+        let runs = &*runs_on_char_boundaries(&text, runs);
         let mut layout = self
             .platform_text_system
             .layout_line(&text, font_size, runs);
@@ -1142,6 +1144,32 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
             }
         }
     }
+}
+
+/// Moves each run's end back to the start of the character it falls inside, since a platform
+/// text system splits the text at those ends.
+fn runs_on_char_boundaries<'a>(text: &str, runs: &'a [FontRun]) -> Cow<'a, [FontRun]> {
+    let mut end = 0;
+    if runs.iter().all(|run| {
+        end += run.len;
+        text.is_char_boundary(end)
+    }) {
+        return Cow::Borrowed(runs);
+    }
+    let mut snapped = Vec::with_capacity(runs.len());
+    let (mut start, mut end) = (0, 0);
+    for run in runs {
+        end += run.len;
+        let edge = text.floor_char_boundary(end);
+        if edge > start {
+            snapped.push(FontRun {
+                len: edge - start,
+                ..*run
+            });
+            start = edge;
+        }
+    }
+    Cow::Owned(snapped)
 }
 
 /// A run of text with a single font.
