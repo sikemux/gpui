@@ -37,6 +37,8 @@ inspector = ["gpui_macros/inspector"]
 # by setting `GPUI_LEAK_DETECTION` when building; see `build.rs`.
 leak-detection = []
 font-kit = []
+# Lets the Metal renderer translate a WGSL shader at run time, which links naga.
+metal-wgsl = []
 wayland = []
 x11 = [
     "scap?/x11",

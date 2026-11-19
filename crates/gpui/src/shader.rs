@@ -190,7 +190,10 @@ impl ShaderProgram {
     /// Translates the shader to the Metal Shading Language. The globals are bound at buffer
     /// [`MslShader::GLOBALS_BUFFER`] and the instances at [`MslShader::INSTANCES_BUFFER`] in
     /// both stages.
-    #[cfg(any(target_os = "macos", target_os = "ios", test))]
+    #[cfg(any(
+        all(any(target_os = "macos", target_os = "ios"), feature = "metal-wgsl"),
+        test
+    ))]
     pub fn to_msl(&self) -> Result<MslShader, ShaderError> {
         use naga::back::msl;
 
@@ -245,6 +248,19 @@ impl ShaderProgram {
             vertex_entry,
             fragment_entry,
         })
+    }
+
+    /// Without the `metal-wgsl` feature the Metal renderer draws only a
+    /// [`RawShaderProgram`](crate::RawShaderProgram), which leaves naga out of the binary.
+    #[cfg(all(
+        any(target_os = "macos", target_os = "ios"),
+        not(any(feature = "metal-wgsl", test))
+    ))]
+    pub fn to_msl(&self) -> Result<MslShader, ShaderError> {
+        Err(self.error(
+            "this build leaves out WGSL shaders on Metal: turn on GPUI's `metal-wgsl` feature"
+                .to_string(),
+        ))
     }
 
     /// Translates the shader to HLSL for shader model 5.0. The globals are bound at constant
