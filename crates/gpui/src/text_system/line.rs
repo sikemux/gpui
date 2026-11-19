@@ -631,15 +631,12 @@ fn paint_line(
         );
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
-        let mut first_glyph_x = origin.x;
+        let mut line_start_x = glyph_origin.x;
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
-                if glyph_ix == 0 && run_ix == 0 {
-                    first_glyph_x = glyph_origin.x;
-                }
 
                 if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
                     wraps.next();
@@ -692,6 +689,7 @@ fn paint_line(
                         wraps.peek(),
                     ) + gap;
                     glyph_origin.y += line_height;
+                    line_start_x = glyph_origin.x - glyph.position.x;
                 }
                 prev_glyph_position = glyph.position;
 
@@ -822,12 +820,7 @@ fn paint_line(
             }
         }
 
-        let mut last_line_end_x = first_glyph_x + layout.width;
-        if let Some(boundary) = wrap_boundaries.last() {
-            let run = &layout.runs[boundary.run_ix];
-            let glyph = &run.glyphs[boundary.glyph_ix];
-            last_line_end_x -= glyph.position.x;
-        }
+        let last_line_end_x = line_start_x + layout.width;
 
         if let Some((mut underline_start, underline_style, underline_range)) =
             current_underline.take()
@@ -910,6 +903,7 @@ fn paint_line_background(
         );
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
+        let mut line_start_x = glyph_origin.x;
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
@@ -948,6 +942,7 @@ fn paint_line_background(
                         wraps.peek(),
                     ) + gap;
                     glyph_origin.y += line_height;
+                    line_start_x = glyph_origin.x - glyph.position.x;
                 }
                 prev_glyph_position = glyph.position;
 
@@ -999,12 +994,7 @@ fn paint_line_background(
             }
         }
 
-        let mut last_line_end_x = origin.x + layout.width;
-        if let Some(boundary) = wrap_boundaries.last() {
-            let run = &layout.runs[boundary.run_ix];
-            let glyph = &run.glyphs[boundary.glyph_ix];
-            last_line_end_x -= glyph.position.x;
-        }
+        let last_line_end_x = line_start_x + layout.width;
 
         if let Some((mut background_origin, background_color)) = current_background.take() {
             if last_line_end_x == background_origin.x {
@@ -1991,6 +1981,62 @@ mod tests {
             )
             .size_full()
         }
+    }
+
+    #[gpui::test]
+    fn an_underline_ends_with_the_words_after_a_gap_at_the_start(cx: &mut TestAppContext) {
+        test_underline_handler_at_scales(cx, |window, cx| {
+            let text = SharedString::from("aa bb cc");
+            let run = TextRun {
+                len: text.len(),
+                font: font(".ZedMono"),
+                color: black(),
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    ..UnderlineStyle::default()
+                }),
+                ..TextRun::default()
+            };
+            let wrapped = window
+                .text_system()
+                .shape_text_with_gaps(
+                    text.clone(),
+                    px(16.),
+                    &[run],
+                    &[(0, px(40.))],
+                    Some(px(80.)),
+                    None,
+                )
+                .expect("shaped");
+            let line = &wrapped[0];
+            assert!(!line.wrap_boundaries().is_empty(), "it wraps");
+            window.next_frame.scene.clear();
+            line.paint(
+                point(px(0.), px(0.)),
+                px(20.),
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .expect("painted");
+            let last = window
+                .next_frame
+                .scene
+                .underlines
+                .last()
+                .expect("an underline");
+            let right = (last.bounds.origin.x + last.bounds.size.width).0 / window.scale_factor();
+            let end = line
+                .position_for_index(text.len(), px(20.))
+                .expect("a place")
+                .x;
+            assert!(
+                (right - end.0).abs() < 1.,
+                "the last row's underline ends at {right}, its words at {end:?}"
+            );
+            window.next_frame.scene.clear();
+        });
     }
 
     fn test_underline_handler_at_scales(
