@@ -1123,9 +1123,12 @@ pub(crate) struct RepaintSite {
     pub(crate) prepaint_range: Range<PrepaintStateIndex>,
     pub(crate) paint_range: Range<PaintIndex>,
     pub(crate) bounds: Bounds<Pixels>,
-    /// How far the view's unrounded top-left lay from `bounds.origin`, in device pixels, so
-    /// drawing it again alone snaps its contents where the whole window snapped them.
-    pub(crate) snap_remainder: Point<f32>,
+    /// The view's unrounded Taffy origin and size in device pixels, and the outer element offset
+    /// active when it prepainted, so an in-place repaint lays out and snaps bit-for-bit like the
+    /// whole frame.
+    pub(crate) taffy_origin: Point<f32>,
+    pub(crate) taffy_size: Size<f32>,
+    pub(crate) element_offset: Point<Pixels>,
     pub(crate) parent_node: Option<DispatchNodeId>,
     pub(crate) element_id_stack: ElementIdStack,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
@@ -4156,13 +4159,14 @@ impl Window {
                             .layout_engine
                             .as_mut()
                             .unwrap()
-                            .set_root_origin(root, site.snap_remainder);
+                            .set_root_origin(root, site.taffy_origin);
                         let room = element.layout_as_root(
                             size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
                             window,
                             cx,
                         );
-                        let fitted = element.layout_as_root(site.bounds.size.into(), window, cx);
+                        window.compute_layout_in_device_pixels(root, site.taffy_size, cx);
+                        let fitted = window.layout_bounds(root).size;
                         (element, room, fitted)
                     })
                 });
@@ -4236,11 +4240,11 @@ impl Window {
                 .parent_node
                 .map(|node| node.moved(|index| shift_count(index, 0, &holes)));
             self.next_frame.dispatch_tree.open_node(parent);
-            let (entity, origin, element) =
-                (repaint.entity, site.bounds.origin, &mut repaint.element);
+            let (entity, offset, element) =
+                (repaint.entity, site.element_offset, &mut repaint.element);
             self.in_site(&site, entity, |window| {
                 window.set_view_id(entity);
-                element.prepaint_at(origin, window, cx);
+                element.prepaint_at(offset, window, cx);
             });
             let end = self.prepaint_index();
             holes.push(Hole {
@@ -5079,12 +5083,15 @@ impl Window {
     }
 
     /// Records where a view that may be drawn again in place prepainted, from `start`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn end_repaint_site(
         &mut self,
         entity: EntityId,
         view: AnyView,
         bounds: Bounds<Pixels>,
-        snap_remainder: Point<f32>,
+        taffy_origin: Point<f32>,
+        taffy_size: Size<f32>,
+        element_offset: Point<Pixels>,
         (start, parent_node): (PrepaintStateIndex, Option<DispatchNodeId>),
     ) {
         let site = RepaintSite {
@@ -5092,7 +5099,9 @@ impl Window {
             prepaint_range: start..self.prepaint_index(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
             bounds,
-            snap_remainder,
+            taffy_origin,
+            taffy_size,
+            element_offset,
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
@@ -6720,19 +6729,33 @@ impl Window {
         self.layout_engine = Some(layout_engine);
     }
 
-    /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by
-    /// GPUI itself automatically in order to pass your element its `Bounds` automatically.
-    ///
-    /// This method should only be called as part of element drawing.
-    /// How far the laid out node's unrounded top-left lies from the device pixel it snapped to.
-    pub(crate) fn snap_remainder(&mut self, layout_id: LayoutId) -> Point<f32> {
+    pub(crate) fn compute_layout_in_device_pixels(
+        &mut self,
+        layout_id: LayoutId,
+        available_space: Size<f32>,
+        cx: &mut App,
+    ) {
+        self.invalidator.debug_assert_prepaint();
+
+        let frame_stats_layout = crate::frame_stats::start();
+        let mut layout_engine = self.layout_engine.take().unwrap();
+        layout_engine.compute_layout_in_device_pixels(layout_id, available_space, self, cx);
+        crate::frame_stats::record(crate::frame_stats::Phase::Layout, frame_stats_layout);
+        self.layout_engine = Some(layout_engine);
+    }
+
+    pub(crate) fn unrounded_layout(&mut self, layout_id: LayoutId) -> (Point<f32>, Size<f32>) {
         let scale_factor = self.scale_factor();
         self.layout_engine
             .as_mut()
             .unwrap()
-            .snap_remainder(layout_id, scale_factor)
+            .unrounded_layout(layout_id, scale_factor)
     }
 
+    /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by
+    /// GPUI itself automatically in order to pass your element its `Bounds` automatically.
+    ///
+    /// This method should only be called as part of element drawing.
     pub fn layout_bounds(&mut self, layout_id: LayoutId) -> Bounds<Pixels> {
         self.invalidator.debug_assert_prepaint();
 
@@ -12240,5 +12263,137 @@ mod repaint_tests {
         cx.run_until_parked();
         assert_eq!(renders.get(), frame_renders, "only the view drew again");
         assert_eq!(cx.debug_bounds("centered").unwrap(), before);
+    }
+
+    struct StretchedComposer {
+        typed: usize,
+    }
+
+    impl Render for StretchedComposer {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(
+                div()
+                    .w_full()
+                    .px(px(16.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(820.))
+                            .h(px(120.))
+                            .debug_selector(|| "composer-card".into())
+                            .child(self.typed.to_string()),
+                    ),
+            )
+        }
+    }
+
+    struct SplitStage {
+        composer: crate::Entity<StretchedComposer>,
+        on_right: bool,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for SplitStage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let pane = div()
+                .size_full()
+                .border(px(1.))
+                .p(px(6.))
+                .flex()
+                .flex_col()
+                .child(div().flex_1().min_h_0())
+                .child(self.composer.clone().into_element().isolated());
+            let mut left = div().flex().min_w_0().min_h_0().flex_basis(px(0.)).h_full();
+            left.style().flex_grow = Some(500.);
+            let mut right = div().flex().min_w_0().min_h_0().flex_basis(px(0.)).h_full();
+            right.style().flex_grow = Some(500.);
+            let (left, right) = if self.on_right {
+                (left.child(div().size_full()), right.child(pane))
+            } else {
+                (left.child(pane), right.child(div().size_full()))
+            };
+            div()
+                .size_full()
+                .flex()
+                .child(left)
+                .child(div().flex_none().w(px(10.)).h_full())
+                .child(right)
+        }
+    }
+
+    struct SplitFrame {
+        stage: crate::Entity<SplitStage>,
+        rail_width: f32,
+        stage_width: f32,
+    }
+
+    impl Render for SplitFrame {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(self.rail_width + self.stage_width))
+                .h(px(600.))
+                .flex()
+                .child(div().flex_none().w(px(self.rail_width)).h_full())
+                .child(
+                    div().flex_1().min_w_0().h_full().child(
+                        self.stage
+                            .clone()
+                            .cached(crate::StyleRefinement::default().size_full()),
+                    ),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn test_an_isolated_view_in_a_fractional_width_split_draws_again_where_it_was(
+        cx: &mut TestAppContext,
+    ) {
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            for on_right in [false, true] {
+                for width in [1801.0_f32, 1805.0, 1806.0, 1813.0, 1815.0] {
+                    let renders = Rc::new(Cell::new(0));
+                    let rail_width = 270.0_f32;
+                    let (frame, wcx) = cx.add_window_view(|window, cx| {
+                        window.set_scale_factor(scale);
+                        window.resize(crate::size(px(rail_width + width), px(600.)));
+                        let composer = cx.new(|_| StretchedComposer { typed: 0 });
+                        let stage = cx.new(|_| SplitStage {
+                            composer,
+                            on_right,
+                            renders: renders.clone(),
+                        });
+                        SplitFrame {
+                            stage,
+                            rail_width,
+                            stage_width: width,
+                        }
+                    });
+                    wcx.run_until_parked();
+                    let before = wcx.debug_bounds("composer-card").unwrap();
+                    let frame_renders = renders.get();
+                    let composer =
+                        frame.read_with(wcx, |frame, cx| frame.stage.read(cx).composer.clone());
+                    composer.update(wcx, |composer, cx| {
+                        composer.typed += 1;
+                        cx.notify();
+                    });
+                    wcx.run_until_parked();
+                    assert_eq!(
+                        renders.get(),
+                        frame_renders,
+                        "only the isolated view drew again (scale={scale}, on_right={on_right}, width={width})"
+                    );
+                    assert_eq!(
+                        wcx.debug_bounds("composer-card").unwrap(),
+                        before,
+                        "bounds must match full frame (scale={scale}, on_right={on_right}, width={width})"
+                    );
+                }
+            }
+        }
     }
 }

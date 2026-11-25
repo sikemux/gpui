@@ -195,17 +195,44 @@ impl TaffyLayoutEngine {
         window: &mut Window,
         cx: &mut App,
     ) {
-        // Leaving this here until we have a better instrumentation approach.
-        // println!("Laying out {} children", self.count_all_children(id)?);
-        // println!("Max layout depth: {}", self.max_depth(0, id)?);
+        let scale_factor = window.scale_factor();
 
-        // Output the edges (branches) of the tree in Mermaid format for visualization.
-        // println!("Edges:");
-        // for (a, b) in self.get_edges(id)? {
-        //     println!("N{} --> N{}", u64::from(a), u64::from(b));
-        // }
-        //
+        let transform = |v: AvailableSpace| match v {
+            AvailableSpace::Definite(pixels) => {
+                TaffyAvailableSpace::Definite(pixels.0 * scale_factor)
+            }
+            AvailableSpace::MinContent => TaffyAvailableSpace::MinContent,
+            AvailableSpace::MaxContent => TaffyAvailableSpace::MaxContent,
+        };
+        let available_space = TaffySize {
+            width: transform(available_space.width),
+            height: transform(available_space.height),
+        };
+        self.compute_layout_device(id, available_space, window, cx);
+    }
 
+    pub fn compute_layout_in_device_pixels(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<f32>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let available_space = TaffySize {
+            width: TaffyAvailableSpace::Definite(available_space.width),
+            height: TaffyAvailableSpace::Definite(available_space.height),
+        };
+        self.compute_layout_device(id, available_space, window, cx);
+    }
+
+    #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
+    fn compute_layout_device(
+        &mut self,
+        id: LayoutId,
+        available_space: TaffySize<TaffyAvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         if !self.computed_layouts.insert(id) {
             let stack = &mut self.layout_bounds_scratch_space;
             stack.push(id);
@@ -224,22 +251,10 @@ impl TaffyLayoutEngine {
 
         let scale_factor = window.scale_factor();
 
-        let transform = |v: AvailableSpace| match v {
-            AvailableSpace::Definite(pixels) => {
-                AvailableSpace::Definite(Pixels(pixels.0 * scale_factor))
-            }
-            AvailableSpace::MinContent => AvailableSpace::MinContent,
-            AvailableSpace::MaxContent => AvailableSpace::MaxContent,
-        };
-        let available_space = size(
-            transform(available_space.width),
-            transform(available_space.height),
-        );
-
         self.taffy
             .compute_layout_with_measure(
                 id.into(),
-                available_space.into(),
+                available_space,
                 |input, _id, node_context, style| {
                     taffy::compute_leaf_layout(
                         input,
@@ -357,10 +372,17 @@ impl TaffyLayoutEngine {
     // snapped independently, but the raw content-box origin can carry a
     // 1dp residual into descendants.
 
-    /// How far the node's unrounded top-left lies from the device pixel it snapped to.
-    pub fn snap_remainder(&mut self, id: LayoutId, scale_factor: f32) -> Point<f32> {
+    /// The node's unrounded top-left and size in device pixels from its last layout.
+    pub fn unrounded_layout(&mut self, id: LayoutId, scale_factor: f32) -> (Point<f32>, Size<f32>) {
         self.layout_bounds(id, scale_factor);
-        self.absolute_outer_origins[&id].map(|at| at - round_half_toward_zero(at))
+        let origin = self.absolute_outer_origins[&id];
+        let size = self
+            .taffy
+            .layout(id.into())
+            .expect(EXPECT_MESSAGE)
+            .size
+            .into();
+        (origin, size)
     }
 
     /// Lays out the root `id` as though it began at `origin`, in device pixels, so what it

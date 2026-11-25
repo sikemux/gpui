@@ -505,6 +505,7 @@ impl<V: View> Element for ViewElement<V> {
                 entity_id,
                 self.handle.take(),
                 self.layout_id,
+                self.cached_style.is_some(),
                 global_id,
                 bounds,
                 element,
@@ -614,6 +615,7 @@ fn prepaint_view(
     entity_id: EntityId,
     handle: Option<AnyView>,
     layout_id: Option<LayoutId>,
+    cached: bool,
     global_id: Option<&GlobalElementId>,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
@@ -628,8 +630,29 @@ fn prepaint_view(
     if let Some((handle, start)) = site
         && (carried || !window.next_frame.repaint_sites.contains_key(&entity_id))
     {
-        let remainder = layout_id.map_or_else(Point::default, |id| window.snap_remainder(id));
-        window.end_repaint_site(entity_id, handle, bounds, remainder, start);
+        let (taffy_origin, taffy_size, element_offset) = match layout_id.filter(|_| !cached) {
+            Some(id) => {
+                let (origin, size) = window.unrounded_layout(id);
+                (origin, size, window.element_offset())
+            }
+            None => {
+                let scale = window.scale_factor();
+                (
+                    Point::default(),
+                    bounds.size.map(|d| d.0 * scale),
+                    bounds.origin,
+                )
+            }
+        };
+        window.end_repaint_site(
+            entity_id,
+            handle,
+            bounds,
+            taffy_origin,
+            taffy_size,
+            element_offset,
+            start,
+        );
     }
     prepainted
 }
