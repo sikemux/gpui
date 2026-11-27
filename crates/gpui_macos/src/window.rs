@@ -2411,6 +2411,10 @@ impl PlatformWindow for MacWindow {
         self.0.lock().draw_ground(scene, true);
     }
 
+    fn shader_time(&self) -> f32 {
+        self.0.lock().renderer.shader_time()
+    }
+
     fn draw_layered(
         &self,
         scene: &gpui::Scene,

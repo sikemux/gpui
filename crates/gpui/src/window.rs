@@ -1607,6 +1607,9 @@ pub struct Window {
     pub(crate) frame_number: u64,
     /// Set while a frame draws only some views again and copies the rest of the last one.
     pub(crate) patching: bool,
+    /// Defers replaying `tab_stops` during an isolated repaint whose repainted views held none,
+    /// so the previous frame's `TabStopMap` can be swapped in directly when they still add none.
+    defer_tab_stops: bool,
     /// Where this frame drew views again, for moving what it kept of the last one.
     prepaint_holes: Vec<Hole<PrepaintStateIndex>>,
     paint_holes: Vec<Hole<PaintIndex>>,
@@ -2564,6 +2567,7 @@ impl Window {
             repaint_capable: FxHashSet::default(),
             frame_number: 0,
             patching: false,
+            defer_tab_stops: false,
             prepaint_holes: Vec::new(),
             paint_holes: Vec::new(),
             redraw_everything: false,
@@ -4289,15 +4293,32 @@ impl Window {
     /// Paints the last frame's root again, copying it but for the views being drawn again.
     fn paint_repaints(&mut self, repaints: &mut [Repaint], cx: &mut App) {
         let root = self.rendered_frame.root_paint.clone();
+        let defer_tab_stops = root.start.tab_handle_index == 0
+            && self.next_frame.tab_stops.insertion_history.is_empty()
+            && repaints.iter().all(|repaint| {
+                repaint.site.paint_range.start.tab_handle_index
+                    == repaint.site.paint_range.end.tab_handle_index
+            });
+        self.defer_tab_stops = defer_tab_stops;
         let mut holes: Vec<Hole<PaintIndex>> = Vec::new();
+        let mut emitted_tab_ranges: Vec<Range<usize>> = if defer_tab_stops {
+            Vec::with_capacity(repaints.len())
+        } else {
+            Vec::new()
+        };
         let mut at = root.start.clone();
         for repaint in repaints.iter_mut() {
             let site = repaint.site.clone();
             self.reuse_paint(at..site.paint_range.start.clone());
             let start = self.paint_index();
             let (entity, element) = (repaint.entity, &mut repaint.element);
+            self.defer_tab_stops = false;
             self.in_site(&site, entity, |window| element.paint(window, cx));
+            self.defer_tab_stops = defer_tab_stops;
             let end = self.paint_index();
+            if defer_tab_stops {
+                emitted_tab_ranges.push(start.tab_handle_index..end.tab_handle_index);
+            }
             holes.push(Hole {
                 old: site.paint_range.clone(),
                 new: start.clone()..end.clone(),
@@ -4307,7 +4328,56 @@ impl Window {
                 drawn.paint_range = start..end;
             }
         }
-        self.reuse_paint(at..root.end);
+        self.reuse_paint(at..root.end.clone());
+        self.defer_tab_stops = false;
+        if defer_tab_stops {
+            if self.next_frame.tab_stops.insertion_history.is_empty()
+                && root.end.tab_handle_index
+                    == self.rendered_frame.tab_stops.insertion_history.len()
+            {
+                mem::swap(
+                    &mut self.next_frame.tab_stops,
+                    &mut self.rendered_frame.tab_stops,
+                );
+                for (hole, repaint) in holes.iter_mut().zip(repaints.iter()) {
+                    let tab_index = hole.old.start.tab_handle_index;
+                    hole.new.start.tab_handle_index = tab_index;
+                    hole.new.end.tab_handle_index = tab_index;
+                    if let Some(drawn) = self.next_frame.repaint_sites.get_mut(&repaint.entity) {
+                        drawn.paint_range.start.tab_handle_index = tab_index;
+                        drawn.paint_range.end.tab_handle_index = tab_index;
+                    }
+                }
+            } else {
+                let emitted = mem::take(&mut self.next_frame.tab_stops.insertion_history);
+                self.next_frame.tab_stops.clear();
+                let mut tab_at = root.start.tab_handle_index;
+                for ((hole, repaint), emitted_range) in holes
+                    .iter_mut()
+                    .zip(repaints.iter())
+                    .zip(emitted_tab_ranges)
+                {
+                    self.next_frame.tab_stops.replay(
+                        &self.rendered_frame.tab_stops.insertion_history
+                            [tab_at..hole.old.start.tab_handle_index],
+                    );
+                    let new_start = self.next_frame.tab_stops.paint_index();
+                    self.next_frame.tab_stops.replay(&emitted[emitted_range]);
+                    let new_end = self.next_frame.tab_stops.paint_index();
+                    hole.new.start.tab_handle_index = new_start;
+                    hole.new.end.tab_handle_index = new_end;
+                    if let Some(drawn) = self.next_frame.repaint_sites.get_mut(&repaint.entity) {
+                        drawn.paint_range.start.tab_handle_index = new_start;
+                        drawn.paint_range.end.tab_handle_index = new_end;
+                    }
+                    tab_at = hole.old.end.tab_handle_index;
+                }
+                self.next_frame.tab_stops.replay(
+                    &self.rendered_frame.tab_stops.insertion_history
+                        [tab_at..root.end.tab_handle_index],
+                );
+            }
+        }
         self.paint_holes = holes;
     }
 
@@ -5184,10 +5254,12 @@ impl Window {
                 .iter()
                 .map(|(id, type_id)| (id.clone(), *type_id)),
         );
-        self.next_frame.tab_stops.replay(
-            &self.rendered_frame.tab_stops.insertion_history
-                [range.start.tab_handle_index..range.end.tab_handle_index],
-        );
+        if !self.defer_tab_stops && range.start.tab_handle_index < range.end.tab_handle_index {
+            self.next_frame.tab_stops.replay(
+                &self.rendered_frame.tab_stops.insertion_history
+                    [range.start.tab_handle_index..range.end.tab_handle_index],
+            );
+        }
 
         if !self.patching {
             self.text_system.reuse_layouts(
@@ -6593,6 +6665,11 @@ impl Window {
         }
         self.platform_window.schedule_frame();
         self.invalidator.wake_platform();
+    }
+
+    /// Seconds since this window's renderer started, matching `globals.time` in raw shaders.
+    pub fn shader_time(&self) -> f32 {
+        self.platform_window.shader_time()
     }
 
     fn present_ground_layer(&mut self) {

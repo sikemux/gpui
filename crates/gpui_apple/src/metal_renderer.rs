@@ -683,6 +683,10 @@ impl MetalRenderer {
         renderer
     }
 
+    pub fn shader_time(&self) -> f32 {
+        self.started.elapsed().as_secs_f32()
+    }
+
     /// Fills the layer with `color` and draws `shaders` over it, their bounds scaled by
     /// `scale` from the window's device pixels to the layer's.
     /// Whether it drew: it skips the pass when it has no layer, no drawable or no room for the shaders.

@@ -1341,6 +1341,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     /// Draws the scene's ground and the shaders painted on it, and nothing else.
     fn draw_ground(&self, _scene: &Scene) {}
+    /// Seconds since this window's renderer started, matching `globals.time` in raw shaders.
+    fn shader_time(&self) -> f32 {
+        0.0
+    }
     fn schedule_frame(&self) {}
     /// Whether presenting an unchanged frame keeps the display at its full refresh rate, so the
     /// window goes on presenting for a moment after high-rate input. A compositor that only

@@ -2079,6 +2079,13 @@ impl PlatformWindow for WaylandWindow {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
+    fn shader_time(&self) -> f32 {
+        self.borrow()
+            .renderer
+            .as_ref()
+            .map_or(0.0, WgpuRenderer::shader_time)
+    }
+
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
         let state = &mut *state;

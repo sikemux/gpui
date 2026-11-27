@@ -1911,6 +1911,15 @@ impl PlatformWindow for X11Window {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
+    fn shader_time(&self) -> f32 {
+        self.0
+            .state
+            .borrow()
+            .renderer
+            .as_ref()
+            .map_or(0.0, WgpuRenderer::shader_time)
+    }
+
     fn draw(&self, scene: &Scene) {
         let mut inner = self.0.state.borrow_mut();
         let inner = &mut *inner;

@@ -1839,6 +1839,15 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    pub fn shader_time(&self) -> f32 {
+        match &self.state {
+            RendererState::Ready { core, .. } | RendererState::Unconfigured { core } => {
+                core.started.elapsed().as_secs_f32()
+            }
+            RendererState::Released => 0.0,
+        }
+    }
+
     /// Renders the scene and presents it at once. Returns false when no frame reached the
     /// surface, in which case the caller should try again later.
     pub fn draw(&mut self, scene: &Scene) -> bool {
@@ -2729,11 +2738,17 @@ impl WgpuRendererCore {
                 continue;
             }
             let pipeline = self.create_raw_shader_pipeline(shader.program, image);
-            self.resources_mut().raw_shader_pipelines.insert(key, pipeline);
+            self.resources_mut()
+                .raw_shader_pipelines
+                .insert(key, pipeline);
         }
     }
 
-    fn create_raw_shader_pipeline(&self, program: &RawShaderProgram, image: bool) -> wgpu::RenderPipeline {
+    fn create_raw_shader_pipeline(
+        &self,
+        program: &RawShaderProgram,
+        image: bool,
+    ) -> wgpu::RenderPipeline {
         let resources = self.resources();
         let device = &resources.device;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
